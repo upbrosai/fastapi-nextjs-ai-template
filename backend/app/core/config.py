@@ -25,8 +25,8 @@ def parse_cors(v: Any) -> list[str] | str:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        # Use top level .env file (one level above ./backend/)
-        env_file="../.env",
+        # Use the .env file in ./backend/
+        env_file="./.env",
         env_ignore_empty=True,
         extra="ignore",
     )
@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
     FRONTEND_HOST: str = "http://localhost:5173"
     ENVIRONMENT: Literal["local", "staging", "production"] = "local"
+
+    # Debug settings
+    PYCHARM_DEBUG_ENABLED: bool = False
+    PYCHARM_DEBUG_PORT: int = 8087
+    PYCHARM_DEBUG_HOST: str = "localhost"
 
     BACKEND_CORS_ORIGINS: Annotated[
         list[AnyUrl] | str, BeforeValidator(parse_cors)

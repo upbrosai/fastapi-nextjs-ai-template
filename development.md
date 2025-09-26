@@ -5,7 +5,7 @@
 * Start the local stack with Docker Compose:
 
 ```bash
-docker compose watch
+docker compose -f docker/docker-compose.yml watch
 ```
 
 * Now you can open your browser and interact with these URLs:
@@ -25,13 +25,13 @@ Traefik UI, to see how the routes are being handled by the proxy: http://localho
 To check the logs, run (in another terminal):
 
 ```bash
-docker compose logs
+docker compose -f docker/docker-compose.yml logs
 ```
 
 To check the logs of a specific service, add the name of the service, e.g.:
 
 ```bash
-docker compose logs backend
+docker compose -f docker/docker-compose.yml logs backend
 ```
 
 ## Local Development
@@ -45,7 +45,7 @@ This way, you could turn off a Docker Compose service and start its local develo
 For example, you can stop that `frontend` service in the Docker Compose, in another terminal, run:
 
 ```bash
-docker compose stop frontend
+docker compose -f docker/docker-compose.yml stop frontend
 ```
 
 And then start the local frontend development server:
@@ -58,7 +58,7 @@ npm run dev
 Or you could stop the `backend` Docker Compose service:
 
 ```bash
-docker compose stop backend
+docker compose -f docker/docker-compose.yml stop backend
 ```
 
 And then you can run the local development server for the backend:
@@ -68,7 +68,7 @@ cd backend
 fastapi dev app/main.py
 ```
 
-## Docker Compose in `localhost.tiangolo.com`
+## Docker Compose in `localhost.upbrosai.com`
 
 When you start the Docker Compose stack, it uses `localhost` by default, with different ports for each service (backend, frontend, adminer, etc).
 
@@ -76,49 +76,54 @@ When you deploy it to production (or staging), it will deploy each service in a 
 
 In the guide about [deployment](deployment.md) you can read about Traefik, the configured proxy. That's the component in charge of transmitting traffic to each service based on the subdomain.
 
-If you want to test that it's all working locally, you can edit the local `.env` file, and change:
+If you want to test that it's all working locally, you can edit the `docker/.env` file, and change:
 
 ```dotenv
-DOMAIN=localhost.tiangolo.com
+DOMAIN=localhost.upbrosai.com
 ```
 
 That will be used by the Docker Compose files to configure the base domain for the services.
 
-Traefik will use this to transmit traffic at `api.localhost.tiangolo.com` to the backend, and traffic at `dashboard.localhost.tiangolo.com` to the frontend.
+Traefik will use this to transmit traffic at `api.localhost.upbrosai.com` to the backend, and traffic at `dashboard.localhost.upbrosai.com` to the frontend.
 
-The domain `localhost.tiangolo.com` is a special domain that is configured (with all its subdomains) to point to `127.0.0.1`. This way you can use that for your local development.
+The domain `localhost.upbrosai.com` is a special domain that is configured (with all its subdomains) to point to `127.0.0.1`. This way you can use that for your local development.
 
 After you update it, run again:
 
 ```bash
-docker compose watch
+docker compose -f docker/docker-compose.yml watch
 ```
 
-When deploying, for example in production, the main Traefik is configured outside of the Docker Compose files. For local development, there's an included Traefik in `docker-compose.override.yml`, just to let you test that the domains work as expected, for example with `api.localhost.tiangolo.com` and `dashboard.localhost.tiangolo.com`.
+When deploying, for example in production, the main Traefik is configured outside of the Docker Compose files. For local development, there's an included Traefik in `docker-compose.override.yml`, just to let you test that the domains work as expected, for example with `api.localhost.upbrosai.com` and `dashboard.localhost.upbrosai.com`.
 
 ## Docker Compose files and env vars
 
-There is a main `docker-compose.yml` file with all the configurations that apply to the whole stack, it is used automatically by `docker compose`.
+There is a main `docker/docker-compose.yml` file with all the configurations that apply to the whole stack, it is used automatically by `docker compose`.
 
-And there's also a `docker-compose.override.yml` with overrides for development, for example to mount the source code as a volume. It is used automatically by `docker compose` to apply overrides on top of `docker-compose.yml`.
+And there's also a `docker/docker-compose.override.yml` with overrides for development, for example to mount the source code as a volume. It is used automatically by `docker compose` to apply overrides on top of `docker-compose.yml`.
 
-These Docker Compose files use the `.env` file containing configurations to be injected as environment variables in the containers.
+These Docker Compose files use the `docker/.env` file containing configurations to be injected as environment variables in the containers.
 
 They also use some additional configurations taken from environment variables set in the scripts before calling the `docker compose` command.
 
 After changing variables, make sure you restart the stack:
 
 ```bash
-docker compose watch
+docker compose -f docker/docker-compose.yml watch
 ```
 
-## The .env file
+## Environment Variables
 
-The `.env` file is the one that contains all your configurations, generated keys and passwords, etc.
+The project uses separate `.env` files for each module:
+- `docker/.env` - Docker Compose configuration
+- `backend/.env` - Backend application configuration
+- `frontend/.env` - Frontend application configuration (if needed)
+
+Each module has its own `.env.example` file as a template.
 
 Depending on your workflow, you could want to exclude it from Git, for example if your project is public. In that case, you would have to make sure to set up a way for your CI tools to obtain it while building or deploying your project.
 
-One way to do it could be to add each environment variable to your CI/CD system, and updating the `docker-compose.yml` file to read that specific env var instead of reading the `.env` file.
+One way to do it could be to add each environment variable to your CI/CD system, and updating the `docker-compose.yml` file to read that specific env var instead of reading the module-specific `.env` files.
 
 ## Pre-commits and code linting
 
@@ -188,20 +193,20 @@ Traefik UI: http://localhost:8090
 
 MailCatcher: http://localhost:1080
 
-### Development URLs with `localhost.tiangolo.com` Configured
+### Development URLs with `localhost.upbrosai.com` Configured
 
 Development URLs, for local development.
 
-Frontend: http://dashboard.localhost.tiangolo.com
+Frontend: http://dashboard.localhost.upbrosai.com
 
-Backend: http://api.localhost.tiangolo.com
+Backend: http://api.localhost.upbrosai.com
 
-Automatic Interactive Docs (Swagger UI): http://api.localhost.tiangolo.com/docs
+Automatic Interactive Docs (Swagger UI): http://api.localhost.upbrosai.com/docs
 
-Automatic Alternative Docs (ReDoc): http://api.localhost.tiangolo.com/redoc
+Automatic Alternative Docs (ReDoc): http://api.localhost.upbrosai.com/redoc
 
-Adminer: http://localhost.tiangolo.com:8080
+Adminer: http://localhost.upbrosai.com:8080
 
-Traefik UI: http://localhost.tiangolo.com:8090
+Traefik UI: http://localhost.upbrosai.com:8090
 
-MailCatcher: http://localhost.tiangolo.com:1080
+MailCatcher: http://localhost.upbrosai.com:1080

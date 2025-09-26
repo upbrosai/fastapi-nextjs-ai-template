@@ -2,7 +2,7 @@
 name = "app"
 version = "0.1.0"
 description = ""
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.12,<4.0"
 dependencies = [
     "fastapi[standard]<1.0.0,>=0.114.2",
     "python-multipart<1.0.0,>=0.0.7",
@@ -31,7 +31,10 @@ dev-dependencies = [
     "pre-commit<4.0.0,>=3.6.2",
     "types-passlib<2.0.0.0,>=1.7.7.20240106",
     "coverage<8.0.0,>=7.4.3",
+    "pydevd-pycharm~=252.25557.178",
 ]
+# uv 包管理器配置 - 使用国内镜像加速
+index-url = "https://mirrors.aliyun.com/pypi/simple"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,2480 @@
+#!/usr/bin/env python3
+"""
+MoChat 开发环境设置工具
+
+功能特性:
+- 多种部署模式（本地开发、Docker开发、生产部署）
+- 实时进度显示与任务编号
+- 智能容器状态跟踪（区分UP/DOWN操作）
+- Docker logs 实时输出
+- 数字键快速选择菜单
+"""
+
+import os
+import sys
+import time
+import select
+import termios
+import tty
+import subprocess
+import signal
+import threading
+import argparse
+import platform
+import fcntl
+import re
+import queue
+import random
+from typing import List, Tuple, Optional, Dict, Any, Callable
+from datetime import datetime
+from collections import defaultdict, deque
+
+
+# ========== 全局配置 ==========
+
+# 颜色定义
+class Colors:
+    RESET = '\033[0m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+
+
+# 任务状态符号
+class TaskSymbols:
+    PENDING = f"{Colors.BLUE}⏺{Colors.RESET}"
+    RUNNING = f"{Colors.YELLOW}⏺{Colors.RESET}"
+    SUCCESS = f"{Colors.GREEN}✓{Colors.RESET}"
+    FAILED = f"{Colors.RED}✗{Colors.RESET}"
+    WARNING = f"{Colors.YELLOW}⚠{Colors.RESET}"
+
+
+# 全局变量
+SKIP_CONFIRMATIONS = False
+USER_CANCELLED = False
+SAFE_MODE = os.environ.get('CI') == 'true' or not sys.stdin.isatty()
+NO_MENU = SAFE_MODE
+SIMPLE_MODE = False  # 简单输出模式
+CURRENT_MODE = None  # 当前选择的模式
+LAST_EXECUTOR = None  # 最后执行的TaskExecutor实例
+
+
+# ========== 任务定义（数据驱动） ==========
+
+def get_commands_mapping():
+    """获取命令映射表"""
+    return {
+        # 检查命令
+        "check:docker": lambda: "docker version",
+        "check:envpatch": lambda: "command -v env-patch",
+
+        # 配置生成
+        "config:backend": lambda envpatch=None: (
+            f"cd backend && ../env-patch -p {envpatch} -o .env" if envpatch
+            else "cd backend && test -f .env.dev.envpatch && ../env-patch || echo '跳过 Backend 配置生成（未找到 envpatch 文件）'"
+        ),
+        "config:docker": lambda envpatch=None: (
+            f"cd docker && ../env-patch -p {envpatch} -o .env" if envpatch
+            else "cd docker && test -f .env.dev.envpatch && ../env-patch  || echo '跳过 Docker 配置生成（未找到 envpatch 文件）'"
+        ),
+        "config:web": lambda: "cd web && test -f .env.dev.envpatch && ../env-patch || true",
+
+        # Docker 操作
+        "docker:down": lambda path="docker", services=None: (
+            f"cd {path} && docker compose down" if not services
+            else f"cd {path} && docker compose down {' '.join(services)}"
+        ),
+        "docker:down-all": lambda: "cd docker && docker compose down -v --remove-orphans",
+        "docker:down-db-redis": lambda: "cd docker && docker compose rm -s -f -v postgres redis",
+        "docker:up-all": lambda path="docker", services=None, force_recreate=True: (
+            f"cd {path} && docker compose up -d --wait{' --force-recreate' if force_recreate else ''}" if not services
+            else f"cd {path} && docker compose up -d --wait{' --force-recreate' if force_recreate else ''} {' '.join(services)}"
+        ),
+        "docker:up-db-redis": lambda: "cd docker && docker compose up -d --wait --force-recreate postgres redis",
+
+        # 构建命令
+        "build:backend": lambda platform=None: f"./build-image backend{f' --platform {platform}' if platform else ''}",
+        "build:web": lambda platform=None: f"./build-image web{f' --platform {platform}' if platform else ''}",
+
+        # 依赖安装
+        "deps:uv": lambda: "command -v uv || pip install uv -i https://mirrors.aliyun.com/pypi/simple",
+        "deps:backend": lambda: "cd backend && ([ -d .venv ] || uv venv) && uv sync --dev",
+        "deps:web": lambda: "cd web && pnpm install",
+
+    }
+
+
+def get_modes_config():
+    """获取部署模式配置"""
+    return {
+        "1": {  # 本地开发模式
+            "name": "本地开发模式",
+            "desc": "本地运行代码，Docker 运行数据库（推荐开发使用）",
+            "tasks": [
+                # 基础检查
+                ("check:docker", "检查 Docker 环境"),
+                # 配置生成
+                ("config:backend", "生成 Backend 配置文件(backend/.env)"),
+                ("config:docker", "生成 Docker 配置文件(docker/.env)"),
+                # 服务管理
+                ("docker:down-db-redis", "Docker Compose Down [Service: postgres redis]"),
+                ("docker:up-db-redis", "Docker Compose Up [Service: postgres redis]", {"services": ["postgres", "redis"]}),
+                # 依赖安装
+                ("deps:uv", "检查并安装 uv"),
+                ("deps:backend", "创建虚拟环境并安装 Backend 依赖"),
+                ("config:web", "生成 Web 配置文件(web/.env)"),
+                ("deps:web", "安装 Web 依赖"),
+            ]
+        },
+        "2": {  # Docker 开发模式
+            "name": "Docker 开发模式",
+            "desc": "全部服务容器化运行，使用开发配置（推荐快速体验）",
+            "parallel": [],
+            "tasks": [
+                # 基础检查
+                ("check:docker", "检查 Docker 环境"),
+                # 配置生成 - Docker模式不需要生成API配置
+                ("config:docker", "生成 Docker 配置文件(docker/.env)"),
+                # Docker 构建（先构建镜像）
+                ("build:backend", "Docker Build Backend 镜像"),
+                ("build:web", "Docker Build Web 镜像"),
+                # 服务管理 - 清理旧容器
+                ("docker:down-all", "Docker Compose Down [Service: All]"),
+                # 启动服务
+                ("docker:up-all", "Docker Compose Up [Service: All]"),
+            ]
+        },
+        "3": {  # 生产部署模式
+            "name": "生产环境部署",
+            "desc": "选择环境配置并部署到生产环境",
+            "parallel": [],
+            "tasks": [
+                # 基础检查
+                ("check:docker", "检查 Docker 环境"),
+                # 配置生成（需要指定环境文件）
+                ("config:backend", "生成 Backend 配置文件(backend/.env)"),
+                ("config:docker", "生成 Docker 配置文件(docker/.env)"),
+                # Docker 构建（生产环境，先构建）
+                ("build:backend", "Docker Build Backend 镜像（生产环境）", {"platform": "linux/amd64"}),
+                ("build:web", "Docker Build Web 镜像（生产环境）", {"platform": "linux/amd64"}),
+                # 服务管理 - 清理旧容器
+                ("docker:down-all", "Docker Compose Down [Service: All]"),
+                # 启动服务
+                ("docker:up-all", "Docker Compose Up [Service: All]"),
+            ]
+        }
+    }
+
+
+# ========== UI 组件 ==========
+
+class AlternateScreen:
+    """备用屏幕管理器 - 像 vim/less 一样"""
+    _active = False  # 类变量，跟踪是否已经在 AlternateScreen 中
+
+    def __enter__(self):
+        if not SIMPLE_MODE and sys.stdout.isatty() and not AlternateScreen._active:
+            # 切换到备用屏幕
+            sys.stdout.write('\033[?1049h')
+            # 清屏并移到顶部
+            sys.stdout.write('\033[2J\033[H')
+            sys.stdout.flush()
+            AlternateScreen._active = True
+            self._entered = True
+        else:
+            self._entered = False
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not SIMPLE_MODE and sys.stdout.isatty() and self._entered:
+            # 清除当前屏幕内容
+            sys.stdout.write('\033[2J\033[H')
+            # 恢复主屏幕
+            sys.stdout.write('\033[?1049l')
+            sys.stdout.flush()
+            AlternateScreen._active = False
+
+
+class UI:
+    """UI 组件集合"""
+
+    @staticmethod
+    def clear_screen():
+        """清屏"""
+        print('\033[2J\033[H', end='', flush=True)
+
+    @staticmethod
+    def draw_header(mode_name=None, progress=None):
+        """绘制头部信息"""
+        try:
+            width = os.get_terminal_size().columns
+        except:
+            width = 80  # 默认宽度
+
+        print(f"{Colors.CYAN}{'─' * width}{Colors.RESET}")
+
+        # 标题行
+        title = "🚀 MoChat 开发环境设置"
+        if mode_name:
+            title += f" ({mode_name})"
+        print(f"{Colors.CYAN}{title.center(width)}{Colors.RESET}")
+
+        # 进度条行
+        if progress is not None:
+            current, total = progress
+            progress_bar = UI.progress_bar(current, total, width=30)
+            progress_line = f"{progress_bar}".center(width + 10)  # +10 for color codes
+            print(f"{progress_line}")
+
+        print(f"{Colors.CYAN}{'─' * width}{Colors.RESET}")
+
+    @staticmethod
+    def progress_bar(current: int, total: int, width: int = 40) -> str:
+        """生成进度条"""
+        if total == 0:
+            return f"[{'█' * width}] 100%"
+        percent = current / total
+        filled = int(width * percent)
+        bar = '█' * filled + '░' * (width - filled)
+        return f"[{Colors.GREEN}{bar}{Colors.RESET}] {percent * 100:.0f}%"
+
+    @staticmethod
+    def menu(prompt: str, options: List[str], default: int = 0) -> Optional[int]:
+        """交互式菜单 - 支持数字键选择"""
+        if SAFE_MODE:
+            print(f"非交互式环境，自动选择默认选项: {options[default]}")
+            return default
+
+        current = default
+
+        def get_key():
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(sys.stdin.fileno())
+                key = sys.stdin.read(1)
+                if key == '\x1b':  # ESC序列
+                    next_chars = sys.stdin.read(2)
+                    if next_chars == '[A':  # 上箭头
+                        return 'UP'
+                    elif next_chars == '[B':  # 下箭头
+                        return 'DOWN'
+                    else:  # 纯ESC键
+                        return 'ESC'
+                elif key == '\x03':  # Ctrl+C
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    raise KeyboardInterrupt
+                return key
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        def draw_menu():
+            UI.clear_screen()
+            UI.draw_header()
+            print(f"\n{prompt}\n")
+
+            # 隐藏光标
+            print("\033[?25l", end='', flush=True)
+
+            # 添加数字编号
+            for i, option in enumerate(options):
+                if i == current:
+                    # 当前选中项：使用绿色和箭头
+                    marker = "→"
+                    print(f" {Colors.GREEN}{marker} {i + 1}. {option}{Colors.RESET}")
+                else:
+                    # 未选中项：使用普通颜色
+                    marker = " "
+                    if i == len(options) - 1 and "退出" in option:
+                        print(f" {marker} {i + 1}. {option} (ESC)")
+                    else:
+                        print(f" {marker} {i + 1}. {option}")
+
+        while True:
+            draw_menu()
+            try:
+                key = get_key()
+            except KeyboardInterrupt:
+                # Ctrl+C 按下，优雅退出
+                print(f"\n\n{Colors.YELLOW}已取消{Colors.RESET}")
+                sys.exit(0)
+
+            if key == 'UP' and current > 0:  # 上箭头
+                current -= 1
+            elif key == 'DOWN' and current < len(options) - 1:  # 下箭头
+                current += 1
+            elif key == '\r':  # Enter
+                # 恢复光标显示
+                print("\033[?25h", end='', flush=True)
+                return current
+            elif key == 'q' or key == 'ESC':  # q键或ESC键退出
+                # 恢复光标显示
+                print("\033[?25h", end='', flush=True)
+                return None
+            elif key.isdigit():  # 数字键快速选择
+                num = int(key)
+                if 1 <= num <= len(options):
+                    # 恢复光标显示
+                    print("\033[?25h", end='', flush=True)
+                    return num - 1
+
+
+# ========== Docker 日志监控器 ==========
+
+class DisplayManager:
+    """统一的显示管理器"""
+
+    def __init__(self, width: int = 80):
+        self.width = width
+        self.spinner = ["⠏", "⠛", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+        self.color_cycle = [Colors.BLUE, Colors.CYAN, Colors.GREEN, Colors.YELLOW]
+        self.color_index = 0
+
+    def clear_screen(self):
+        """清屏并移到顶部"""
+        print("\033[2J\033[H", end='')
+
+    def display_header(self, title: str = "MOCHAT DEV-SETUP"):
+        """显示统一的标题头"""
+        self.clear_screen()
+        padding = (self.width - len(title)) // 2
+        print(f"{' ' * padding}{Colors.CYAN}{title}{Colors.RESET}")
+        print(f"{Colors.DIM}{'=' * self.width}{Colors.RESET}")
+
+    def display_task_status(self, task_idx: int, total_tasks: int, desc: str,
+                            status: str, elapsed: int = None):
+        """显示任务状态行"""
+        # 任务状态符号
+        if status == "running":
+            # 运行中的任务使用颜色循环的圆点动画
+            color = self.color_cycle[self.color_index % len(self.color_cycle)]
+            symbol = f"{color}⏺{Colors.RESET}"
+            self.color_index += 1
+        elif status == "success":
+            symbol = TaskSymbols.SUCCESS
+        elif status == "failed":
+            symbol = TaskSymbols.FAILED
+        else:
+            symbol = TaskSymbols.PENDING
+
+        # 格式化任务信息
+        task_prefix = f"[{task_idx}/{total_tasks}]"
+        if elapsed is not None:
+            print(f"\n{symbol} {task_prefix} {desc} (耗时: {elapsed}s)")
+        else:
+            print(f"\n{symbol} {task_prefix} {desc}")
+        print(f"{Colors.DIM}{'─' * self.width}{Colors.RESET}")
+
+    def display_task_list(self, title: str, tasks: List[Tuple], show_elapsed: bool = False):
+        """显示任务列表"""
+        print(f"\n{Colors.CYAN}▶ {title}{Colors.RESET}")
+        for task_info in tasks:
+            if len(task_info) >= 3:
+                idx, desc, success = task_info[:3]
+                symbol = TaskSymbols.SUCCESS if success else TaskSymbols.FAILED
+
+                if show_elapsed and len(task_info) >= 4:
+                    elapsed = task_info[3]
+                    elapsed_str = f" (耗时: {elapsed}s)" if elapsed > 0 else ""
+                    print(f"  {symbol} [{idx}] {desc}{elapsed_str}")
+                else:
+                    print(f"  {symbol} [{idx}] {desc}")
+
+    def display_container_status(self, containers: Dict[str, str], operation_type: str = None):
+        """显示容器状态"""
+        if not containers:
+            return
+
+        print(f"\n{Colors.CYAN}▶ 容器状态{Colors.RESET}")
+        for container, status in sorted(containers.items()):
+            # 根据操作类型判断状态
+            if operation_type == "DOWN":
+                is_complete = status in ["Stopped", "Removed"]
+                is_in_progress = status in ["Stopping", "Removing"]
+            elif operation_type == "UP":
+                # Network 的 Created 状态表示已完成，容器的 Created 需要继续等待
+                if "Network:" in container:
+                    is_complete = status in ["Created", "Started", "Running", "Healthy"]
+                else:
+                    is_complete = status in ["Started", "Running", "Healthy"]
+                is_in_progress = status in ["Starting", "Creating", "Waiting"]
+            else:
+                is_complete = status in ["Started", "Running", "Healthy", "Removed", "Created"]
+                is_in_progress = status in ["Starting", "Creating", "Stopping", "Removing", "Waiting"]
+
+            # 显示容器状态
+            if is_complete:
+                print(f"  {Colors.GREEN}✓{Colors.RESET}  {container:<40} {Colors.GREEN}{status}{Colors.RESET}")
+            elif is_in_progress:
+                spinner = self.spinner[int(time.time() * 10) % len(self.spinner)]
+                print(
+                    f"  {Colors.YELLOW}{spinner}{Colors.RESET}  {container:<40} {Colors.YELLOW}{status}{Colors.RESET}")
+            else:
+                print(f"  {Colors.DIM}○{Colors.RESET}  {container:<40} {Colors.DIM}{status}{Colors.RESET}")
+
+    def display_logs(self, title: str, logs: List[str], max_lines: int = 10):
+        """显示日志"""
+        if not logs:
+            return
+
+        print(f"\n{Colors.CYAN}▶ {title}{Colors.RESET}")
+        recent_logs = logs[-max_lines:] if len(logs) > max_lines else logs
+
+        for log_line in recent_logs:
+            if log_line.strip():
+                # 根据日志内容应用不同颜色
+                if any(keyword in log_line.lower() for keyword in ["error", "failed", "exception"]):
+                    print(f"  {Colors.RED}▸{Colors.RESET} {log_line[:80]}{'...' if len(log_line) > 80 else ''}")
+                elif any(keyword in log_line.lower() for keyword in
+                         ["success", "done", "complete", "installed", "ready", "started"]):
+                    print(f"  {Colors.GREEN}▸{Colors.RESET} {log_line[:80]}{'...' if len(log_line) > 80 else ''}")
+                elif "warning" in log_line.lower() or "warn" in log_line.lower():
+                    print(f"  {Colors.YELLOW}▸{Colors.RESET} {log_line[:80]}{'...' if len(log_line) > 80 else ''}")
+                else:
+                    print(f"  {Colors.DIM}▸{Colors.RESET} {log_line[:80]}{'...' if len(log_line) > 80 else ''}")
+
+    def display_task_details(self, title: str, details: List[str]):
+        """显示任务详情"""
+        if not details:
+            return
+
+        print(f"\n{Colors.CYAN}▶ {title}{Colors.RESET}")
+        for detail in details:
+            if detail.strip():
+                # 特殊样式处理
+                if "⚠" in detail or "warning" in detail.lower():
+                    print(f"  {Colors.YELLOW}⚠{Colors.RESET} {detail.replace('⚠', '').strip()}")
+                elif "✓" in detail:
+                    # 如果详情中已经有 ✓，就直接使用，不要重复添加
+                    cleaned_detail = detail.replace('✓', '').strip()
+                    print(f"  {Colors.GREEN}✓{Colors.RESET} {cleaned_detail}")
+                elif "registry" in detail:
+                    # 如果是镜像相关信息，添加绿色勾号
+                    print(f"  {Colors.GREEN}✓{Colors.RESET} {detail}")
+                else:
+                    print(f"  {Colors.DIM}{detail}{Colors.RESET}")
+
+    def display_footer(self, running: bool = False):
+        """显示页脚分隔线"""
+        if not running:
+            print(f"\n{Colors.DIM}{'─' * self.width}{Colors.RESET}")
+
+    def display_claude_code_style(self, title: str, items: List[str], show_expandable: bool = True):
+        """显示 Claude Code 风格的输出"""
+        if show_expandable and len(items) > 5:
+            visible_items = items[:3]
+            hidden_count = len(items) - 3
+
+            print(f"\n{Colors.YELLOW}⏺{Colors.RESET} {title}")
+            for item in visible_items:
+                print(f"  {Colors.DIM}⎿{Colors.RESET}  {item}")
+            print(
+                f"  {Colors.DIM}⎿{Colors.RESET}  {Colors.DIM}Found {len(items)} items ({hidden_count} more - ctrl+r to expand){Colors.RESET}")
+        else:
+            print(f"\n{Colors.YELLOW}⏺{Colors.RESET} {title}")
+            for item in items:
+                print(f"  {Colors.DIM}⎿{Colors.RESET}  {item}")
+
+    def display_execution_logs(self, logs: List[str]):
+        """显示执行日志，Claude Code 风格"""
+        if not logs:
+            return
+
+        # 按任务类型分组日志
+        task_groups = {}
+        current_task = None
+
+        for log in logs:
+            if log.startswith("🔧"):
+                current_task = log
+                task_groups[current_task] = []
+            elif current_task and log.strip():
+                task_groups[current_task].append(log)
+
+        # 显示每个任务组
+        for task_title, task_logs in task_groups.items():
+            if task_logs:
+                self.display_claude_code_style(task_title, task_logs)
+
+
+class BaseProgressDisplay:
+    """统一显示系统的兼容性封装"""
+    _display_manager = DisplayManager()
+
+    @staticmethod
+    def display_header(title: str = "MOCHAT DEV-SETUP", width: int = 80):
+        BaseProgressDisplay._display_manager.display_header(title)
+
+    @staticmethod
+    def display_task_info(task_prefix: str, desc: str, task_symbol: str, elapsed: int = None, width: int = 80):
+        # 解析任务前缀获取索引
+        if task_prefix.startswith('[') and '/' in task_prefix:
+            parts = task_prefix.strip('[]').split('/')
+            if len(parts) == 2:
+                try:
+                    idx, total = int(parts[0]), int(parts[1])
+                    status = "running" if "⏺" in task_symbol else ("success" if "✓" in task_symbol else "failed")
+                    BaseProgressDisplay._display_manager.display_task_status(idx, total, desc, status, elapsed)
+                    return
+                except ValueError:
+                    pass
+
+        # 回退到原有逻辑
+        if elapsed is not None:
+            print(f"\n{task_symbol} {task_prefix} {desc} (耗时: {elapsed}s)")
+        else:
+            print(f"\n{task_symbol} {task_prefix} {desc}")
+        print(f"{Colors.DIM}{'─' * width}{Colors.RESET}")
+
+    @staticmethod
+    def display_footer(elapsed: int, running: bool, width: int = 80):
+        BaseProgressDisplay._display_manager.display_footer(running)
+
+    @staticmethod
+    def display_logs(title: str, logs: List[str], max_lines: int = 10):
+        BaseProgressDisplay._display_manager.display_logs(title, logs, max_lines)
+
+
+class DockerLogsMonitor:
+    """Docker logs 监控器"""
+
+    def __init__(self):
+        self.logs_queue = queue.Queue()
+        self.logs_buffer = deque(maxlen=5)  # 只保留最近5行
+        self.monitor_thread = None
+        self.running = False
+
+    def start(self):
+        """启动日志监控"""
+        self.running = True
+        self.monitor_thread = threading.Thread(target=self._monitor_logs)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+
+    def stop(self):
+        """停止日志监控"""
+        self.running = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=1)
+
+    def _monitor_logs(self):
+        """监控 docker compose logs"""
+        # 等待一下，确保容器启动
+        time.sleep(0.5)
+
+        try:
+            # 检查是否有容器在运行
+            check_process = subprocess.run(
+                ["docker", "compose", "ps", "-q"],
+                cwd="docker",
+                capture_output=True,
+                text=True
+            )
+
+            if not check_process.stdout.strip():
+                # 没有容器运行，不启动日志监控
+                return
+
+            # 启动 docker compose logs -f
+            process = subprocess.Popen(
+                ["docker", "compose", "logs", "-f", "--tail", "20"],
+                cwd="docker",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+
+            while self.running and process.poll() is None:
+                try:
+                    line = process.stdout.readline()
+                    if line:
+                        # 过滤和清理日志行
+                        cleaned = self._clean_log_line(line.rstrip())
+                        if cleaned:
+                            self.logs_queue.put(cleaned)
+                            self.logs_buffer.append(cleaned)
+                except:
+                    pass
+
+            if process.poll() is None:
+                process.terminate()
+        except:
+            pass
+
+    def _clean_log_line(self, line: str) -> Optional[str]:
+        """清理日志行"""
+        # 过滤掉一些无用的日志
+        skip_patterns = [
+            "Attaching to",
+            "Container",
+            "level=warning",
+            "[+] Running"
+        ]
+
+        if any(pattern in line for pattern in skip_patterns):
+            return None
+
+        # 提取有用的信息
+        if "|" in line:
+            parts = line.split("|", 1)
+            if len(parts) > 1:
+                return parts[1].strip()
+
+        return line.strip() if line.strip() else None
+
+    def get_recent_logs(self) -> List[str]:
+        """获取最近的日志"""
+        return list(self.logs_buffer)
+
+
+# ========== 任务执行器 ==========
+
+class TaskExecutor:
+    """统一的任务执行器"""
+
+    def __init__(self):
+        self.commands = get_commands_mapping()
+        self.results = []
+        self.current_task = None
+        self.output_buffer = []
+        self.spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.spinner_idx = 0
+        self.container_states = {}  # 容器状态跟踪
+        self.operation_type = None  # 当前操作类型: 'UP' 或 'DOWN'
+        self.logs_monitor = DockerLogsMonitor()
+        self.current_task_info = None
+        self.recent_output = []
+        self.built_images = []  # 存储构建的镜像信息
+        self.parallel_task_descs = []  # 并行任务描述列表
+        self.output_lock = threading.Lock()  # 线程安全的输出锁
+        self.task_lines = {}  # 存储每个任务的输出行号
+        self.completed_tasks = []  # 保存所有完成的任务
+        self.task_elapsed_times = {}  # 保存每个任务的耗时 {task_index: elapsed_time}
+        self.all_task_details = []  # 保存所有任务详情
+        self.task_detail_extractors = self._init_detail_extractors()  # 任务详情提取器
+        self.last_failure = None  # 保存最后的失败信息
+        self.display_manager = DisplayManager()  # 统一的显示管理器
+
+    def _init_detail_extractors(self):
+        """初始化任务详情提取器"""
+        return {
+            "check:docker": self._extract_docker_check_details,
+            "check:env-patch": self._extract_tool_version_details,
+            "check:version": self._extract_version_check_details,
+            "config:backend": self._extract_config_details,
+            "config:docker": self._extract_config_details,
+            "config:web": self._extract_config_details,
+            "build:backend": self._extract_docker_build_details,
+            "build:web": self._extract_docker_build_details,
+            "docker:build": self._extract_docker_build_details,
+            "docker:compose:down": self._extract_docker_compose_details,
+            "docker:compose:up": self._extract_docker_compose_details,
+            "docker:compose:milvus-up": self._extract_milvus_details,
+            "docker:compose:milvus-down": self._extract_milvus_details,
+            "docker:down-dify": self._extract_docker_compose_details,
+            "docker:down": self._extract_docker_compose_details,
+            "docker:up-dify": self._extract_docker_compose_details,
+            "docker:down-milvus": self._extract_milvus_details,
+            "docker:up-milvus": self._extract_milvus_details,
+            "deps:backend": self._extract_deps_install_details,
+            "deps:web": self._extract_deps_install_details,
+            "deps:check-uv": self._extract_tool_version_details,
+            "deps:uv": self._extract_tool_version_details,
+        }
+
+    def _extract_docker_check_details(self, output: List[str]) -> List[str]:
+        """提取 Docker 检查的详情"""
+        details = []
+
+        # 提取版本信息
+        for line in output:
+            if "Docker version" in line or "docker-compose version" in line:
+                details.append(f"✓ {line.strip()}")
+
+        # 获取 Docker 镜像数量
+        try:
+            result = subprocess.run("docker image ls | tail -n +2 | wc -l",
+                                    shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                image_count = result.stdout.strip()
+                details.append(f"✓ Docker 镜像数量: {image_count}")
+        except:
+            pass
+
+        # 获取 Docker Compose 项目数量
+        try:
+            result = subprocess.run("docker compose ls | tail -n +2 | wc -l",
+                                    shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                compose_count = result.stdout.strip()
+                details.append(f"✓ Docker Compose 项目数量: {compose_count}")
+        except:
+            pass
+
+        # 检查镜像加速配置
+        try:
+            result = subprocess.run("docker info 2>/dev/null | grep -i 'Registry Mirrors' -A 5",
+                                    shell=True, capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                if any(mirror in result.stdout for mirror in
+                       ['.aliyuncs.com', '.tencentcloudcr.com', '.mirror.aliyuncs.com']):
+                    details.append("✓ 已配置国内镜像加速")
+                else:
+                    details.append("⚠ 未配置国内镜像加速")
+        except:
+            pass
+
+        return details if details else ["✓ Docker 环境正常"]
+
+    def _extract_tool_version_details(self, output: List[str]) -> List[str]:
+        """提取工具版本详情"""
+        details = []
+        for line in output:
+            if "version" in line.lower() or "Version" in line:
+                details.append(line.strip())
+        return details[:2] if details else ["✓ 工具已安装"]
+
+    def _extract_version_check_details(self, output: List[str]) -> List[str]:
+        """提取版本检查详情"""
+        details = []
+        for line in output:
+            if "dify version" in line or "Container" in line:
+                details.append(line.strip())
+        return details[:2] if details else []
+
+    def _extract_config_details(self, output: List[str]) -> List[str]:
+        """提取配置文件生成详情（完整的 env-patch 输出）"""
+        details = []
+
+        # 收集所有警告信息和结果
+        for line in output:
+            # 收集警告信息
+            if "⚠" in line or "warning" in line.lower():
+                details.append(line.strip())
+            # 收集结果信息
+            elif any(keyword in line for keyword in ["Total keys", "already up to date", "Patched", "Updated", "✓"]):
+                details.append(line.strip())
+
+        # 如果没有详情，至少返回一个成功消息
+        return details if details else ["✓ 配置文件已生成"]
+
+    def _extract_docker_build_details(self, output: List[str]) -> List[str]:
+        """提取 Docker 构建详情"""
+        details = []
+
+        # 提取执行的命令
+        for line in output[:10]:  # 检查前10行
+            if "build-image" in line or "./build-image" in line:
+                # 例如: "+ ./build-image api"
+                details.append(f"{line.strip().lstrip('+').strip()}")
+                break
+
+        # 提取构建的镜像信息
+        for line in output:
+            if "Successfully tagged" in line:
+                # 例如: "Successfully tagged mochat-dify-api:1.7.0-local"
+                parts = line.split("Successfully tagged")
+                if len(parts) > 1:
+                    image_tag = parts[1].strip()
+                    details.append(f"docker image: {image_tag}")
+            elif "naming to" in line:
+                # 例如: "naming to docker.io/library/mochat-dify-api:1.7.0-local"
+                import re
+                match = re.search(r'naming to (.+?)(?:\s+done)?$', line)
+                if match:
+                    image_tag = match.group(1).strip()
+                    details.append(f"docker image: {image_tag}")
+
+        return details if details else ["✓ 镜像构建完成"]
+
+    def _extract_docker_compose_details(self, output: List[str]) -> List[str]:
+        """提取 Docker Compose 操作详情（聚合容器状态）"""
+        container_states = {}
+        details = []
+
+        # 解析所有容器状态变化
+        for line in output:
+            if "Container " in line and any(status in line for status in
+                                            ["Starting", "Started", "Stopping", "Stopped", "Removing", "Removed",
+                                             "Creating", "Created", "Waiting", "Healthy", "Unhealthy", "Error"]):
+
+                # 提取容器名和状态
+                if " Container " in line:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        container = parts[1]
+                        status = parts[2]
+                        container_states[container] = status
+
+        # 显示每个容器的最终状态，每个容器一行
+        if container_states:
+            # 先处理 Network 状态
+            for container, status in sorted(container_states.items()):
+                if "Network:" in container:
+                    network_name = container.replace("Network: ", "")
+                    details.append(f"✓ {network_name} (Network)")
+
+            # 再处理容器状态，按名称排序
+            for container, status in sorted(container_states.items()):
+                if "Network:" not in container:
+                    # 简化容器名显示
+                    simple_name = container.replace("mochat-dify-", "").replace("-1", "")
+
+                    # 根据状态决定显示格式
+                    if status in ["Started", "Healthy", "Running", "Created"]:
+                        details.append(f"✓ {simple_name}: {status}")
+                    elif status in ["Stopped", "Removed"]:
+                        details.append(f"✓ {simple_name}: {status}")
+                    elif status in ["Starting", "Waiting", "Creating", "Stopping", "Removing"]:
+                        details.append(f"⏳ {simple_name}: {status}")
+                    elif status in ["Error", "Unhealthy", "Failed"]:
+                        details.append(f"✗ {simple_name}: {status}")
+                    else:
+                        details.append(f"• {simple_name}: {status}")
+
+        return details[:4] if details else ["✓ 容器操作完成"]
+
+    def _extract_milvus_details(self, output: List[str]) -> List[str]:
+        """提取 Milvus 操作详情"""
+        details = []
+        for line in output:
+            if "milvus" in line.lower() and any(word in line for word in ["Started", "Stopped", "Running"]):
+                details.append(line.strip())
+        return details[:2] if details else ["✓ Milvus 操作完成"]
+
+    def _extract_deps_install_details(self, output: List[str]) -> List[str]:
+        """提取依赖安装详情"""
+        details = []
+        package_lines = []
+
+        # 提取工具版本信息
+        for line in output[:10]:  # 检查前10行，通常版本信息在开头
+            if "uv " in line and ("version" in line or line.startswith("uv")):
+                # 例如: "uv 0.4.7 (1c7e63b26 2024-09-25)"
+                details.append(f"✓ {line.strip()}")
+                break
+            elif "pnpm" in line and "version" in line:
+                # 例如: "Version 8.15.4"
+                details.append(f"✓ pnpm {line.strip()}")
+                break
+
+        # 提取包的变化信息
+        packages_added = 0
+        packages_removed = 0
+        packages_updated = 0
+        total_packages = 0
+        resolved_line = None
+        installed_line = None
+
+        # 对于 uv sync
+        for line in output:
+            if "Resolved" in line and "packages" in line:
+                # 例如: "Resolved 425 packages in 0.90ms"
+                import re
+                match = re.search(r'Resolved (\d+) packages', line)
+                if match:
+                    total_packages = int(match.group(1))
+                    resolved_line = f"✓ {line.strip()}"
+            elif "Installed" in line and "packages" in line:
+                # 例如: "Installed 60 packages in 145ms"
+                import re
+                match = re.search(r'Installed (\d+) packages', line)
+                if match:
+                    packages_added = int(match.group(1))
+                    installed_line = f"✓ {line.strip()}"
+            elif "Removed" in line and "packages" in line:
+                # 例如: "Removed 3 packages"
+                import re
+                match = re.search(r'Removed (\d+) packages', line)
+                if match:
+                    packages_removed = int(match.group(1))
+                    details.append(f"✓ 移除了 {packages_removed} 个包")
+            elif "Updated" in line and "packages" in line:
+                # 例如: "Updated 5 packages"
+                import re
+                match = re.search(r'Updated (\d+) packages', line)
+                if match:
+                    packages_updated = int(match.group(1))
+                    details.append(f"✓ 更新了 {packages_updated} 个包")
+            elif "Audited" in line and "packages" in line:
+                # 例如: "Audited 418 packages in 0.11ms"
+                details.append(f"✓ {line.strip()}")
+            # 收集包安装行（uv sync 的输出）
+            elif line.strip().startswith("+") and not line.startswith("++"):
+                # 例如: " + click-default-group==1.2.4"
+                package_lines.append(line.strip())
+
+        # 添加 resolved 和 installed 行
+        if resolved_line:
+            details.append(resolved_line)
+        if installed_line:
+            details.append(installed_line)
+
+        # 对于 pnpm install - 收集包行
+        pnpm_packages = 0
+        for line in output:
+            if line.startswith("+") and not line.startswith("++") and "pnpm" in str(output):
+                # 例如: "+ next 14.0.4"
+                pnpm_packages += 1
+                if len(package_lines) < 50:  # 限制收集数量
+                    package_lines.append(line.strip())
+            elif "packages, done" in line or "dependencies" in line:
+                # 例如: "dependencies: 1234 packages"
+                import re
+                match = re.search(r'(\d+)\s+packages?', line)
+                if match and not total_packages:
+                    total_packages = int(match.group(1))
+
+        # 添加 pnpm 的包统计（如果有）
+        if pnpm_packages > 0:
+            details.append(f"✓ 新增 {pnpm_packages} 个包")
+
+        # 添加包详情行（限制为10行）
+        if package_lines:
+            # 添加前10个包
+            for i, pkg_line in enumerate(package_lines[:10]):
+                details.append(pkg_line)
+
+            # 如果超过10个包，添加省略信息
+            if len(package_lines) > 10:
+                remaining = len(package_lines) - 10
+                details.append(f"  ... 以及其他 {remaining} 个包")
+
+        # 提取耗时信息
+        for line in output[-10:]:
+            if " in " in line and ("ms" in line or "s" in line):
+                # 例如: "Done in 15.2s" 或 "Installed 2 packages in 1.23s"
+                import re
+                match = re.search(r'in\s+(\d+\.?\d*\s*(?:ms|s))', line)
+                if match and "耗时" not in str(details):
+                    details.append(f"✓ 耗时: {match.group(1)}")
+                    break
+
+        return details if details else ["✓ 依赖安装完成"]
+
+    def execute_command(self, cmd_id: str, desc: str, params: Dict[str, Any] = None) -> Tuple[bool, List[str]]:
+        """执行单个命令"""
+        if cmd_id not in self.commands:
+            return False, [f"未知命令: {cmd_id}"]
+
+        # 判断操作类型
+        if "down" in cmd_id or "停止" in desc or "清理" in desc:
+            self.operation_type = "DOWN"
+        elif "up" in cmd_id or "启动" in desc:
+            self.operation_type = "UP"
+        else:
+            self.operation_type = None
+
+
+        # 获取命令
+        cmd_func = self.commands[cmd_id]
+        params = params or {}
+
+        try:
+            cmd = cmd_func(**params) if callable(cmd_func) else cmd_func
+        except TypeError as e:
+            # 处理参数不匹配的情况
+            cmd = cmd_func()
+
+        # 执行命令
+        if isinstance(cmd, list):
+            # 多个命令串行执行
+            all_output = []
+            for single_cmd in cmd:
+                success, output = self._run_single_command(single_cmd, desc)
+                all_output.extend(output)
+                if not success:
+                    return False, all_output
+            return True, all_output
+        else:
+            return self._run_single_command(cmd, desc)
+
+    def _run_single_command(self, cmd: str, desc: str) -> Tuple[bool, List[str]]:
+        """执行单个命令"""
+        self.current_task = desc
+        output = []
+        start_time = time.time()
+
+        try:
+            # 判断是否需要特殊显示
+            is_docker_op = any(keyword in cmd for keyword in [
+                "docker compose", "docker build", "build-image",
+                "docker", "milvus"
+            ]) and not any(skip in cmd for skip in ["docker version", "check"])
+
+            # 判断是否为依赖安装操作
+            is_deps_install = any(keyword in cmd for keyword in [
+                "uv sync", "pnpm install", "npm install"
+            ]) and "安装" in desc and "依赖" in desc
+
+            # 简单模式下，所有操作都使用简单显示
+            if SIMPLE_MODE:
+                return self._run_command_simple(cmd, desc)
+
+            # Docker 操作 - 使用增强显示
+            if is_docker_op:
+                return self._run_docker_command_enhanced(cmd, desc)
+
+            # 依赖安装操作 - 使用增强显示
+            if is_deps_install:
+                return self._run_deps_install_enhanced(cmd, desc)
+
+            # 其他操作使用原来的逻辑
+            return self._run_command_simple(cmd, desc)
+
+        except Exception as e:
+            return False, [f"执行出错: {str(e)}"]
+
+    def _run_docker_command_enhanced(self, cmd: str, desc: str) -> Tuple[bool, List[str]]:
+        """增强的 Docker 命令执行"""
+        output = []
+        start_time = time.time()
+
+        # 如果已经在 AlternateScreen 中（手动模式），直接执行
+        # 否则创建新的 AlternateScreen（简单模式下的特定 Docker 操作）
+        if not SIMPLE_MODE:
+            # 已经在 AlternateScreen 中，直接执行
+            return self._execute_docker_in_current_screen(cmd, desc, start_time)
+        else:
+            # 手动模式下，直接在当前屏幕执行（已经在 AlternateScreen 中）
+            return self._execute_docker_in_current_screen(cmd, desc, start_time)
+
+    def _execute_docker_in_current_screen(self, cmd: str, desc: str, start_time: float) -> Tuple[bool, List[str]]:
+        """在当前屏幕中执行 Docker 命令"""
+        output = []
+
+        # 启动日志监控（仅对 UP 操作）
+        if "docker compose" in cmd and "logs" not in cmd and self.operation_type == "UP":
+            # 延迟启动，等待容器创建
+            threading.Timer(2.0, self.logs_monitor.start).start()
+
+        try:
+            # 设置环境变量
+            env = os.environ.copy()
+            env['DOCKER_BUILDKIT'] = '1'
+            if "build" in cmd:
+                env['BUILDKIT_PROGRESS'] = 'plain'
+
+            # 创建进程
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env
+            )
+
+            # 重置容器状态
+            if "docker" in cmd:
+                self.container_states = {}
+
+            # 实时处理输出
+            last_display_time = time.time()
+            while True:
+                # 检查进程是否结束
+                if process.poll() is not None:
+                    break
+
+                # 读取输出
+                ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                if ready:
+                    try:
+                        line = process.stdout.readline()
+                        if line:
+                            line = line.rstrip()
+                            output.append(line)
+                            self.recent_output.append(line)
+                            if len(self.recent_output) > 100:
+                                self.recent_output = self.recent_output[-100:]
+
+                            # 解析输出
+                            with self.output_lock:
+                                self._parse_output_line(line, cmd)
+                    except IOError:
+                        pass
+
+                # 定期更新显示（不要太频繁）
+                if time.time() - last_display_time > 0.1:
+                    self._display_alternate_screen_progress(desc, start_time, True)
+                    last_display_time = time.time()
+
+                time.sleep(0.05)
+
+            # 读取剩余输出
+            remaining = process.stdout.read()
+            if remaining:
+                for line in remaining.splitlines():
+                    if line.strip():
+                        output.append(line.rstrip())
+                        self._parse_output_line(line.rstrip(), cmd)
+
+            # 显示最终状态
+            self._display_alternate_screen_progress(desc, start_time, False, process.returncode)
+            time.sleep(1.0)  # 让用户看到最终状态
+
+            # 停止日志监控
+            self.logs_monitor.stop()
+
+            # 特殊处理某些命令的返回码
+            if "command -v" in cmd or "检查" in desc:
+                return True, output
+
+            return process.returncode == 0, output
+
+        finally:
+            self.logs_monitor.stop()
+
+    def _parse_output_line(self, line: str, cmd: str):
+        """解析输出行"""
+        # 解析 Docker 容器状态 - 新格式
+        # 格式: " Container mochat-dify-redis-1  Stopping"
+        if "Container" in line and any(x in line for x in
+                                       ["Starting", "Started", "Stopping", "Stopped", "Removing", "Removed", "Creating",
+                                        "Created", "Healthy", "Waiting"]):
+            # 使用双空格分割，因为容器名和状态之间有多个空格
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[0] == "Container":
+                container_name = parts[1]
+                status = parts[2]
+                # 线程安全地更新容器状态
+                self.container_states[container_name] = status
+
+        # 解析网络操作（可选）
+        elif "Network" in line and any(x in line for x in ["Removing", "Removed", "Creating", "Created"]):
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[0] == "Network":
+                network_name = parts[1]
+                status = parts[2]
+                # 也可以追踪网络状态（使用 Network: 前缀）
+                self.container_states[f"Network: {network_name}"] = status
+
+        # 解析构建的镜像信息
+        if "Successfully tagged" in line or "naming to" in line:
+            match = re.search(r'(registry[^\s]+)', line)
+            if match:
+                self.built_images.append(match.group(1))
+
+    def _display_task_progress(self, desc: str, start_time: float, running: bool, return_code: int = None):
+        """显示任务进度"""
+        if SIMPLE_MODE:
+            return
+
+        with self.output_lock:
+            elapsed = int(time.time() - start_time)
+
+            # 获取任务编号
+            if self.current_task_info:
+                current_idx, total_tasks = self.current_task_info
+                task_prefix = f"[{current_idx}/{total_tasks}]"
+            else:
+                task_prefix = ""
+
+            # 首次显示任务时，打印状态
+            if running and task_prefix not in self.task_lines:
+                if self.current_task_info:
+                    current_idx, total_tasks = self.current_task_info
+                    print(f"\n{TaskSymbols.RUNNING} [{current_idx}/{total_tasks}] {desc}")
+                self.task_lines[task_prefix] = True
+                return
+
+            # 任务完成时，更新最终状态（但不要在 AlternateScreen 后重复显示）
+            if not running and task_prefix in self.task_lines:
+                # 清理任务记录
+                del self.task_lines[task_prefix]
+
+    def _display_alternate_screen_progress(self, desc: str, start_time: float, running: bool, return_code: int = None):
+        """在 AlternateScreen 中显示 Docker 操作进度"""
+        if SIMPLE_MODE:
+            return
+
+        elapsed = int(time.time() - start_time)
+
+        # 显示标题
+        self.display_manager.display_header()
+
+        # 获取任务编号和状态
+        if self.current_task_info:
+            current_idx, total_tasks = self.current_task_info
+            status = "running" if running else ("success" if return_code == 0 else "failed")
+            self.display_manager.display_task_status(current_idx, total_tasks, desc, status, elapsed)
+        else:
+            # 回退显示
+            symbol = TaskSymbols.RUNNING if running else (
+                TaskSymbols.SUCCESS if return_code == 0 else TaskSymbols.FAILED)
+            print(f"\n{symbol} {desc} (耗时: {elapsed}s)")
+            print(f"{Colors.DIM}{'─' * 80}{Colors.RESET}")
+
+        # 显示容器状态
+        if self.container_states:
+            self.display_manager.display_container_status(self.container_states, self.operation_type)
+
+        # 显示最近的输出日志
+        if running:
+            if "build" in desc.lower():
+                # Docker build 任务显示构建日志
+                if self.recent_output:
+                    self.display_manager.display_logs("构建日志", self.recent_output, max_lines=8)
+            elif self.logs_monitor:
+                # Docker compose 任务显示运行日志
+                recent_logs = self.logs_monitor.get_recent_logs()
+                self.display_manager.display_logs("实时日志", recent_logs, max_lines=5)
+
+        # 显示页脚
+        self.display_manager.display_footer(running)
+
+    def _run_command_simple(self, cmd: str, desc: str) -> Tuple[bool, List[str]]:
+        """简单执行命令（无特殊显示）"""
+        try:
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            output, _ = process.communicate()
+            lines = output.splitlines() if output else []
+
+            if "command -v" in cmd or "检查" in desc:
+                return True, lines
+
+            return process.returncode == 0, lines
+        except Exception as e:
+            return False, [f"执行出错: {str(e)}"]
+
+    def execute_tasks(self, tasks: List[Tuple[str, str, Optional[Dict]]],
+                      parallel_tasks: List[Tuple[str, str, Optional[Dict]]] = None,
+                      mode_name: str = None) -> bool:
+        """执行任务列表"""
+        if SIMPLE_MODE:
+            # 简单模式下使用原来的逻辑
+            return self._execute_tasks_simple(tasks, parallel_tasks, mode_name)
+
+        # 手动模式下，直接在当前的 AlternateScreen 中执行（由 main 函数管理）
+        return self._execute_tasks_in_alternate_screen(tasks, parallel_tasks, mode_name)
+
+    def _execute_tasks_in_alternate_screen(self, tasks: List[Tuple[str, str, Optional[Dict]]],
+                                           parallel_tasks: List[Tuple[str, str, Optional[Dict]]] = None,
+                                           mode_name: str = None) -> bool:
+        """在 AlternateScreen 中执行所有任务"""
+        total_tasks = len(tasks) + (1 if parallel_tasks else 0)
+        current_idx = 0
+        # 清空之前的任务记录
+        self.completed_tasks = []
+        self.all_task_details = []
+
+        # Phase 1: 初始选择（Task 0）- 只显示选择，无完成状态
+        self._display_initial_selection(mode_name)
+
+        # 执行并行任务（如果有）
+        if parallel_tasks:
+            current_idx += 1
+            self.current_task_info = (current_idx, total_tasks)
+            task_desc = "并行 Docker Build 任务"
+
+            # Phase 2: 显示任务开始
+            self._display_task_progress(self.completed_tasks, current_idx, total_tasks, task_desc, "running")
+
+            # 执行并行任务
+            success = self._execute_parallel(parallel_tasks, (current_idx, total_tasks))
+
+            # 更新任务状态
+            self.completed_tasks.append((current_idx, task_desc, success))
+            self._display_task_progress(self.completed_tasks, current_idx, total_tasks, task_desc,
+                                        "completed" if success else "failed")
+
+            if not success:
+                time.sleep(2)  # 让用户看到错误
+                return False
+
+            # 收集构建的镜像信息作为任务详情
+            build_details = []
+            # 添加子任务信息（从保存的并行任务描述中获取）
+            for task_desc in self.parallel_task_descs:
+                # 提取命令部分（如 "执行: build-image api" -> "build-image api"）
+                if "执行:" in task_desc:
+                    cmd_part = task_desc.split("执行:")[-1].strip()
+                    build_details.append(f"✓ {cmd_part}")
+                else:
+                    build_details.append(f"✓ {task_desc}")
+            self.parallel_task_descs = []  # 清空
+
+            # 添加构建的镜像信息
+            if self.built_images:
+                # 去重镜像列表
+                unique_images = list(set(self.built_images))
+                for image in unique_images:
+                    build_details.append(f"✓ 构建镜像: {image}")
+                self.built_images = []
+
+            if build_details:
+                self.all_task_details.append((task_desc, build_details))
+                time.sleep(1)
+                self._display_task_progress(self.completed_tasks, current_idx, total_tasks, task_desc, "completed",
+                                            build_details[:4])
+
+        # 执行串行任务
+        for cmd_id, desc, params in tasks:
+            if USER_CANCELLED:
+                return False
+
+            current_idx += 1
+            self.current_task_info = (current_idx, total_tasks)
+
+            # Phase 2: 显示任务开始
+            self._display_task_progress(self.completed_tasks, current_idx, total_tasks, desc, "running")
+
+            # 执行命令
+            task_start_time = time.time()
+            success, output = self.execute_command(cmd_id, desc, params or {})
+            task_elapsed = int(time.time() - task_start_time)
+            self.results.append((desc, success, output))
+
+            # 更新任务状态
+            self.completed_tasks.append((current_idx, desc, success))
+            self.task_elapsed_times[current_idx] = task_elapsed  # 保存耗时
+            self._display_task_progress(self.completed_tasks, current_idx, total_tasks, desc,
+                                        "completed" if success else "failed")
+
+            if not success:
+                self._handle_failure(desc, output)
+                # 保存失败信息以便在 AlternateScreen 退出后显示
+                self.last_failure = (desc, output)
+                time.sleep(3)  # 让用户看到错误
+                return False
+
+            # 使用统一的详情提取器收集任务详情
+            if cmd_id in self.task_detail_extractors and output:
+                extractor = self.task_detail_extractors[cmd_id]
+                task_details = extractor(output)
+                if task_details:
+                    self.all_task_details.append((desc, task_details))
+                    self._display_task_progress(self.completed_tasks, current_idx, total_tasks, desc, "completed",
+                                                task_details[:4])
+
+        # Phase 3: 最终显示 - 只显示完成状态和任务详情
+        self._display_final_summary(self.completed_tasks, self.all_task_details, total_tasks)
+
+        # 等待一下让用户看到最终状态
+        time.sleep(2)
+        return True
+
+    def _display_initial_selection(self, mode_name: str):
+        """Phase 1: 显示初始选择（Task 0）"""
+        print("\033[2J\033[H", end='')  # 清屏
+
+        width = 80
+        title = "MOCHAT DIFY SETUP"
+        padding = (width - len(title)) // 2
+        print(f"{' ' * padding}{Colors.CYAN}{title}{Colors.RESET}")
+        print(f"{Colors.DIM}{'=' * width}{Colors.RESET}")
+
+        # 显示选择的模式
+        print(f"\n已选择: {Colors.GREEN}{mode_name}{Colors.RESET}")
+        print(f"\n{Colors.CYAN}开始执行...{Colors.RESET}")
+        time.sleep(1)
+
+    def _display_task_progress(self, completed_tasks: List[Tuple[int, str, bool]],
+                               current_idx: int, total_tasks: int,
+                               current_desc: str, status: str,
+                               extra_info: List[str] = None):
+        """Phase 2: 显示任务执行过程"""
+        # 使用统一的显示管理器
+        self.display_manager.display_header()
+
+        # 显示当前任务状态
+        self.display_manager.display_task_status(current_idx, total_tasks, current_desc, status)
+
+        # 显示已完成的任务列表
+        if completed_tasks:
+            # 转换为适合DisplayManager的格式
+            task_list = [(idx, desc, success) for idx, desc, success in completed_tasks]
+            self.display_manager.display_task_list("已完成任务", task_list)
+
+        # 显示额外信息（如镜像信息、版本信息等）
+        if extra_info:
+            # 直接使用原始信息，让 display_task_details 处理格式化
+            formatted_info = []
+            for info in extra_info:
+                if isinstance(info, str):
+                    formatted_info.append(info)
+
+            if formatted_info:
+                self.display_manager.display_task_details("任务详情", formatted_info)
+
+        # 显示页脚
+        self.display_manager.display_footer()
+
+    def _display_final_summary(self, completed_tasks: List[Tuple[int, str, bool]],
+                               all_task_details: List[Tuple[str, List[str]]],
+                               total_tasks: int):
+        """Phase 3: 显示最终结果（只显示完成状态和任务详情）"""
+        # 使用统一的显示管理器，显示完成标题
+        self.display_manager.display_header("MOCHAT DIFY SETUP COMPLETED")
+
+        # 显示所有任务的最终状态（包含耗时信息）
+        tasks_with_elapsed = []
+        for idx, desc, success in completed_tasks:
+            # 获取任务耗时
+            elapsed_time = getattr(self, 'task_elapsed_times', {}).get(idx, 0)
+            tasks_with_elapsed.append((idx, desc, success, elapsed_time))
+
+        self.display_manager.display_task_list("任务完成状态", tasks_with_elapsed, show_elapsed=True)
+
+        # 显示所有任务的详情（不显示实时日志）
+        if all_task_details:
+            for task_desc, details in all_task_details:
+                if details:
+                    # 直接使用原始详情，让 display_task_details 处理格式化
+                    formatted_details = details
+
+                    if formatted_details:
+                        self.display_manager.display_task_details(task_desc, formatted_details)
+
+        # 最终状态
+        all_success = all(success for _, _, success in completed_tasks)
+        if all_success:
+            print(f"\n{Colors.GREEN}✓ 所有任务完成！{Colors.RESET}")
+        else:
+            print(f"\n{Colors.RED}✗ 部分任务失败{Colors.RESET}")
+
+        # 显示页脚
+        self.display_manager.display_footer()
+
+    def _execute_tasks_simple(self, tasks: List[Tuple[str, str, Optional[Dict]]],
+                              parallel_tasks: List[Tuple[str, str, Optional[Dict]]] = None,
+                              mode_name: str = None) -> bool:
+        """简单模式下的任务执行（原来的逻辑）"""
+        total_tasks = len(tasks) + (1 if parallel_tasks else 0)
+        current_idx = 0
+
+        # 执行并行任务（如果有）
+        if parallel_tasks:
+            current_idx += 1
+            self.current_task_info = (current_idx, total_tasks)
+
+            print(f"\n{TaskSymbols.PENDING} [{current_idx}/{total_tasks}] 并行 Docker Build 任务")
+
+            success = self._execute_parallel(parallel_tasks, (current_idx, total_tasks))
+            if not success:
+                return False
+
+            # 显示构建的镜像信息
+            if self.built_images:
+                print(f"  {Colors.GREEN}✓{Colors.RESET} 构建完成的镜像:")
+                for image in self.built_images:
+                    print(f"    • {image}")
+                self.built_images = []  # 清空
+
+        # 执行串行任务
+        for cmd_id, desc, params in tasks:
+            if USER_CANCELLED:
+                return False
+
+            current_idx += 1
+            self.current_task_info = (current_idx, total_tasks)
+
+            # 对所有任务统一显示开始信息
+            print(f"\n{TaskSymbols.PENDING} [{current_idx}/{total_tasks}] {desc}")
+
+            # 执行命令
+            success, output = self.execute_command(cmd_id, desc, params or {})
+            self.results.append((desc, success, output))
+
+            if not success:
+                self._handle_failure(desc, output)
+                return False
+
+            # 显示任务结果的关键信息
+            if cmd_id == "check:version" and output:
+                for line in output:
+                    print(f"  {line}")
+            elif "config" in cmd_id and output:
+                # 配置文件生成的结果
+                for line in output[-3:]:
+                    if "Total keys" in line or "already up to date" in line:
+                        print(f"  {Colors.DIM}{line}{Colors.RESET}")
+                    elif "warning" in line.lower():
+                        print(f"  {Colors.YELLOW}{line}{Colors.RESET}")
+            elif "build" in cmd_id and output:
+                # Docker 构建任务的输出
+                print("  构建日志:")
+                for line in output:
+                    if line.strip():
+                        # 过滤和格式化重要的构建信息
+                        if any(keyword in line.lower() for keyword in
+                               ["step", "sending build context", "successful", "error", "failed"]):
+                            print(f"    {line}")
+                        elif "Successfully tagged" in line:
+                            print(f"  {Colors.GREEN}✓{Colors.RESET} {line}")
+            elif "docker" in cmd_id and ("down" in cmd_id or "up" in cmd_id) and output:
+                # Docker Compose 上下操作的输出
+                container_lines = [line for line in output if "Container " in line]
+                if container_lines:
+                    print("  容器状态变化:")
+                    for line in container_lines[-10:]:  # 显示最后10行容器状态
+                        print(f"    {line}")
+            elif "check:docker" in cmd_id and output:
+                # Docker 检查的结果
+                for line in output:
+                    if "Docker version" in line or "version" in line:
+                        print(f"  {Colors.GREEN}✓{Colors.RESET} {line}")
+            elif "deps" in cmd_id and output:
+                # 使用统一的详情提取器获取依赖安装信息
+                if cmd_id in self.task_detail_extractors:
+                    extractor = self.task_detail_extractors[cmd_id]
+                    task_details = extractor(output)
+                    if task_details:
+                        print("  安装信息:")
+                        for detail in task_details:
+                            print(f"    {detail}")
+                else:
+                    # 回退到原有逻辑
+                    key_lines = []
+                    for line in output:
+                        if any(keyword in line.lower() for keyword in
+                               ["installed", "resolved", "version", "complete", "error"]):
+                            key_lines.append(line)
+                    if key_lines:
+                        print("  安装信息:")
+                        for line in key_lines[-5:]:  # 显示最后5行关键信息
+                            print(f"    {line}")
+
+        # 不在这里显示完成信息，由 _display_final_summary 统一处理
+        return True
+
+    def _execute_parallel(self, tasks: List[Tuple[str, str, Optional[Dict]]],
+                          task_info: Tuple[int, int]) -> bool:
+        """并行执行多个任务"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 保存并行任务描述
+        self.parallel_task_descs = [desc for _, desc, _ in tasks]
+
+        # 保存当前的 task_info，以避免子任务显示错误的编号
+        saved_task_info = self.current_task_info
+        self.current_task_info = None  # 临时清空，以避免子任务显示编号
+
+        # 检查是否为 Docker 构建任务
+        is_docker_build = any(cmd_id.startswith("build:") or
+                              "docker build" in str(self.commands.get(cmd_id, "")) or
+                              "build-image" in str(self.commands.get(cmd_id, ""))
+                              for cmd_id, _, _ in tasks)
+
+        if is_docker_build and not SIMPLE_MODE:
+            # Docker 构建任务使用分屏显示
+            success = self._execute_parallel_docker_builds(tasks)
+            # 恢复 task_info
+            self.current_task_info = saved_task_info
+            return success
+
+        # 创建线程池执行任务
+        results = []
+        build_info = []  # 存储构建信息
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            futures = {}
+            for cmd_id, desc, params in tasks:
+                # 使用新的方法来执行命令，不显示任务编号
+                future = executor.submit(self._execute_command_without_display, cmd_id, desc, params or {})
+                futures[future] = desc
+
+            # 等待所有任务完成
+            for future in as_completed(futures):
+                desc = futures[future]
+                try:
+                    success, output = future.result()
+                    results.append((desc, success, output))
+                    if success:
+                        build_info.append((desc, True))
+                        # 提取镜像信息
+                        for line in output:
+                            if "Successfully tagged" in line or "naming to" in line:
+                                match = re.search(r'(registry[^\s]+)', line)
+                                if match:
+                                    self.built_images.append(match.group(1))
+                    else:
+                        build_info.append((desc, False))
+                except Exception as e:
+                    build_info.append((desc, False))
+                    results.append((desc, False, [str(e)]))
+
+        # 恢复 task_info
+        self.current_task_info = saved_task_info
+
+        return all(success for _, success, _ in results)
+
+    def _execute_command_without_display(self, cmd_id: str, desc: str, params: Dict[str, Any] = None) -> Tuple[
+        bool, List[str]]:
+        """执行命令但不显示任务编号（用于并行任务）"""
+        # 直接调用 execute_command，但不会显示任务编号因为 current_task_info 为 None
+        return self.execute_command(cmd_id, desc, params)
+
+    def _execute_parallel_docker_builds(self, tasks: List[Tuple[str, str, Optional[Dict]]]) -> bool:
+        """并行执行 Docker 构建任务，实时显示分屏日志"""
+        import shutil
+        import queue
+
+        # 获取终端宽度
+        term_width = shutil.get_terminal_size().columns
+        # 每个窗口的宽度
+        panel_width = term_width // 2 - 1
+
+        # 创建每个任务的输出队列
+        output_queues = {}
+        processes = {}
+        results = {}
+
+        # 启动所有构建进程
+        for idx, (cmd_id, desc, params) in enumerate(tasks):
+            q = queue.Queue()
+            output_queues[idx] = q
+
+            # 创建线程执行构建
+            thread = threading.Thread(
+                target=self._run_build_with_queue,
+                args=(cmd_id, desc, params or {}, q, results, idx)
+            )
+            thread.start()
+            processes[idx] = thread
+
+        # 清屏并显示分屏标题
+        print("\033[2J\033[H", end='')
+        self._display_split_screen_header(tasks, term_width)
+
+        # 实时显示分屏输出
+        all_done = False
+        task_outputs = {idx: [] for idx in range(len(tasks))}
+        max_lines = 30  # 每个窗口的最大显示行数
+
+        while not all_done:
+            # 检查所有线程是否完成
+            all_done = all(not thread.is_alive() for thread in processes.values())
+
+            # 从每个队列读取新输出
+            has_new_output = False
+            for idx, queue in output_queues.items():
+                while not queue.empty():
+                    line = queue.get()
+                    task_outputs[idx].append(line)
+                    # 保持最近的 N 行
+                    if len(task_outputs[idx]) > max_lines:
+                        task_outputs[idx] = task_outputs[idx][-max_lines:]
+                    has_new_output = True
+
+            # 如果有新输出，更新显示
+            if has_new_output or not all_done:
+                self._display_split_screen_output(tasks, task_outputs, panel_width, max_lines)
+
+            time.sleep(0.1)
+
+        # 显示最终结果
+        print(f"\n{Colors.DIM}{'=' * term_width}{Colors.RESET}")
+
+        # 检查结果
+        all_success = all(results.get(idx, (False,))[0] for idx in range(len(tasks)))
+        return all_success
+
+    def _run_build_with_queue(self, cmd_id: str, desc: str, params: dict, output_queue: queue.Queue, results: dict,
+                              idx: int):
+        """运行构建命令并将输出发送到队列"""
+        try:
+            # 获取命令
+            cmd_func = self.commands.get(cmd_id)
+            if not cmd_func:
+                results[idx] = (False, f"未知命令: {cmd_id}")
+                return
+
+            cmd = cmd_func(**params) if callable(cmd_func) else cmd_func
+
+            # 设置环境变量
+            env = os.environ.copy()
+            env['DOCKER_BUILDKIT'] = '1'
+            env['BUILDKIT_PROGRESS'] = 'plain'
+
+            # 创建进程
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env
+            )
+
+            # 实时读取输出
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                line = line.rstrip()
+                output_queue.put(line)
+
+                # 解析构建的镜像信息
+                if "Successfully tagged" in line or "naming to" in line:
+                    match = re.search(r'(registry[^\s]+)', line)
+                    if match:
+                        self.built_images.append(match.group(1))
+
+            # 等待进程结束
+            process.wait()
+            results[idx] = (process.returncode == 0, "")
+
+        except Exception as e:
+            results[idx] = (False, str(e))
+            output_queue.put(f"Error: {str(e)}")
+
+    def _display_split_screen_header(self, tasks: List[Tuple[str, str, Optional[Dict]]], term_width: int):
+        """显示分屏标题"""
+        # 使用统一的基类显示标题
+        BaseProgressDisplay.display_header("MOCHAT DEV-SETUP", term_width)
+
+        # 获取任务编号
+        if self.current_task_info:
+            current_idx, total_tasks = self.current_task_info
+            task_info = f"[{current_idx}/{total_tasks}] 并行 Docker 构建"
+            print(f"\n{TaskSymbols.RUNNING} {task_info}")
+        else:
+            print(f"\n{TaskSymbols.RUNNING} 并行 Docker 构建")
+
+        # 任务标题
+        if len(tasks) == 2:
+            # 两个任务左右分屏
+            left_title = tasks[0][1]
+            right_title = tasks[1][1]
+            panel_width = term_width // 2 - 1
+
+            # 打印标题行
+            print(f"{Colors.DIM}{'─' * term_width}{Colors.RESET}")
+            left_padded = left_title[:panel_width].center(panel_width)
+            right_padded = right_title[:panel_width].center(panel_width)
+            print(f"{Colors.YELLOW}{left_padded}{Colors.RESET} │ {Colors.YELLOW}{right_padded}{Colors.RESET}")
+            print(f"{Colors.DIM}{'─' * panel_width}┼{'─' * panel_width}{Colors.RESET}")
+
+    def _display_split_screen_output(self, tasks: List[Tuple[str, str, Optional[Dict]]],
+                                     task_outputs: dict, panel_width: int, max_lines: int):
+        """显示分屏输出"""
+        # 移动到输出区域的开始位置（第7行，因为增加了任务信息行）
+        print(f"\033[7;1H", end='')  # 移动到第7行
+
+        if len(tasks) == 2:
+            # 两个任务左右分屏
+            left_output = task_outputs.get(0, [])
+            right_output = task_outputs.get(1, [])
+
+            # 显示每一行
+            for i in range(max_lines):
+                left_line = ""
+                right_line = ""
+
+                if i < len(left_output):
+                    left_line = left_output[i][:panel_width]
+                if i < len(right_output):
+                    right_line = right_output[i][:panel_width]
+
+                # 清除当前行并打印
+                print(f"\033[K{left_line:<{panel_width}} │ {right_line:<{panel_width}}")
+
+        # 清除剩余行
+        print("\033[J", end='')
+
+    def _run_deps_install_enhanced(self, cmd: str, desc: str) -> Tuple[bool, List[str]]:
+        """增强的依赖安装命令执行，显示实时日志"""
+        output = []
+        start_time = time.time()
+
+        # 在当前屏幕中执行，显示实时日志
+        return self._execute_deps_in_current_screen(cmd, desc, start_time)
+
+    def _execute_deps_in_current_screen(self, cmd: str, desc: str, start_time: float) -> Tuple[bool, List[str]]:
+        """在当前屏幕中执行依赖安装命令，显示实时进度"""
+        output = []
+
+        try:
+            # 设置环境变量
+            env = os.environ.copy()
+            # UV 和 pnpm 的彩色输出
+            env['FORCE_COLOR'] = '1'
+
+            # 创建进程
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env
+            )
+
+            # 重置安装进度状态
+            self.install_progress = {
+                'total_packages': 0,
+                'installed_packages': 0,
+                'current_package': '',
+                'download_progress': ''
+            }
+
+            # 实时处理输出
+            last_display_time = time.time()
+            while True:
+                # 检查进程是否结束
+                if process.poll() is not None:
+                    break
+
+                # 读取输出
+                ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                if ready:
+                    try:
+                        line = process.stdout.readline()
+                        if line:
+                            line = line.rstrip()
+                            output.append(line)
+                            self.recent_output.append(line)
+                            if len(self.recent_output) > 100:
+                                self.recent_output = self.recent_output[-100:]
+
+                            # 解析输出
+                            with self.output_lock:
+                                self._parse_deps_output_line(line, cmd)
+                    except IOError:
+                        pass
+
+                # 定期更新显示（不要太频繁）
+                if time.time() - last_display_time > 0.1:
+                    self._display_deps_progress(desc, start_time, True)
+                    last_display_time = time.time()
+
+                time.sleep(0.05)
+
+            # 读取剩余输出
+            remaining = process.stdout.read()
+            if remaining:
+                for line in remaining.splitlines():
+                    if line.strip():
+                        output.append(line.rstrip())
+                        self._parse_deps_output_line(line.rstrip(), cmd)
+
+            # 显示最终状态
+            self._display_deps_progress(desc, start_time, False, process.returncode)
+            time.sleep(1.0)  # 让用户看到最终状态
+
+            return process.returncode == 0, output
+
+        except Exception as e:
+            return False, [f"执行出错: {str(e)}"]
+
+    def _parse_deps_output_line(self, line: str, cmd: str):
+        """解析依赖安装输出行"""
+        # 解析 uv 输出
+        if "uv sync" in cmd or "uv" in cmd:
+            # 捕获版本信息（通常在开头）
+            if line.startswith("uv ") and ("(" in line or "version" in line.lower()):
+                # 例如: "uv 0.4.7 (1c7e63b26 2024-09-25)"
+                self.install_progress['tool_version'] = line.strip()
+            # 例如: "Resolved 425 packages in 0.90ms"
+            elif "Resolved" in line and "packages" in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i + 1 < len(parts) and "package" in parts[i + 1]:
+                        self.install_progress['total_packages'] = int(part)
+                        break
+            # 例如: "Installed 2 packages in 1.23s"
+            elif "Installed" in line and "packages" in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i + 1 < len(parts) and "package" in parts[i + 1]:
+                        self.install_progress['installed_packages'] = int(part)
+                        break
+            # 例如: "Removed 3 packages"
+            elif "Removed" in line and "packages" in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i + 1 < len(parts) and "package" in parts[i + 1]:
+                        self.install_progress['removed_packages'] = int(part)
+                        break
+            # 例如: "Updated 5 packages"
+            elif "Updated" in line and "packages" in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i + 1 < len(parts) and "package" in parts[i + 1]:
+                        self.install_progress['updated_packages'] = int(part)
+                        break
+            # 例如: "Audited 418 packages in 0.11ms"
+            elif "Audited" in line and "packages" in line:
+                self.install_progress['current_package'] = line.strip()
+            # 下载进度，例如: "⠋ pandas==2.1.3"
+            elif any(spinner in line for spinner in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]):
+                self.install_progress['current_package'] = line.strip()
+            # 其他有用信息
+            elif any(keyword in line for keyword in ["Downloading", "Installing", "Building", "Preparing"]):
+                self.install_progress['current_package'] = line.strip()
+
+        # 解析 pnpm 输出
+        elif "pnpm install" in cmd:
+            # 捕获版本信息
+            if "Version" in line and ("pnpm" in cmd or line.strip().startswith("Version")):
+                # 例如: "Version 8.15.4"
+                self.install_progress['tool_version'] = f"pnpm {line.strip()}"
+            # 例如: "Progress: resolved 1234, reused 1200, downloaded 34, added 0"
+            elif "Progress:" in line:
+                self.install_progress['download_progress'] = line.strip()
+                # 提取数字
+                import re
+                numbers = re.findall(r'resolved (\d+)', line)
+                if numbers:
+                    self.install_progress['total_packages'] = int(numbers[0])
+                numbers = re.findall(r'added (\d+)', line)
+                if numbers:
+                    self.install_progress['installed_packages'] = int(numbers[0])
+            # 例如: "+ next 14.0.4"
+            elif line.startswith("+") or line.startswith("└─") or line.startswith("├─"):
+                self.install_progress['current_package'] = line.strip()
+                # 计数新增的包
+                if line.startswith("+") and not line.startswith("++"):
+                    current_added = self.install_progress.get('packages_added', 0)
+                    self.install_progress['packages_added'] = current_added + 1
+            # 完成信息
+            elif "packages" in line and any(word in line for word in ["added", "done", "installed"]):
+                self.install_progress['current_package'] = line.strip()
+                # 提取包数量
+                import re
+                numbers = re.findall(r'(\d+)\s+packages?', line)
+                if numbers:
+                    self.install_progress['installed_packages'] = int(numbers[0])
+
+    def _display_deps_progress(self, desc: str, start_time: float, running: bool, return_code: int = None):
+        """显示依赖安装进度"""
+        if SIMPLE_MODE:
+            return
+
+        elapsed = int(time.time() - start_time)
+
+        # 使用统一的显示管理器
+        self.display_manager.display_header()
+
+        # 获取任务编号并显示任务状态
+        if self.current_task_info:
+            current_idx, total_tasks = self.current_task_info
+            status = "running" if running else ("success" if return_code == 0 else "failed")
+            self.display_manager.display_task_status(current_idx, total_tasks, desc, status, elapsed)
+
+        # 显示安装进度详情
+        if self.install_progress:
+            details = []
+
+            # 总体进度
+            if self.install_progress.get('total_packages'):
+                total = self.install_progress['total_packages']
+                installed = self.install_progress.get('installed_packages', 0)
+                if total > 0:
+                    percent = int((installed / total) * 100)
+                    details.append(f"包总数: {total}, 已安装: {installed} ({percent}%)")
+
+            # 当前操作
+            if self.install_progress.get('current_package'):
+                details.append(f"正在安装: {self.install_progress['current_package']}")
+
+            # 下载进度（pnpm）
+            if self.install_progress.get('download_progress'):
+                details.append(f"下载进度: {self.install_progress['download_progress']}")
+
+            if details:
+                self.display_manager.display_task_details("安装进度", details)
+
+        # 显示最近的输出日志
+        if running and self.recent_output:
+            self.display_manager.display_logs("实时日志", self.recent_output, max_lines=10)
+
+        # 显示页脚
+        self.display_manager.display_footer(running)
+
+    def _handle_failure(self, desc: str, output: List[str]):
+        """处理失败情况"""
+        print(f"\n{Colors.RED}✗ 任务失败: {desc}{Colors.RESET}")
+        print(f"\n{Colors.YELLOW}错误信息:{Colors.RESET}")
+        for line in output[-10:]:  # 显示最后10行
+            print(f"  {line}")
+
+        print(f"\n{Colors.YELLOW}💡 可能的解决方案:{Colors.RESET}")
+        if "docker" in desc.lower():
+            print("  • 确保 Docker 已启动")
+            print("  • 运行: docker version")
+        elif "依赖" in desc:
+            print("  • 检查网络连接")
+            print("  • 清理缓存后重试")
+
+
+# ========== 工具函数 ==========
+
+def get_available_environments() -> List[Tuple[str, str]]:
+    """扫描可用的环境配置文件"""
+    docker_dir = os.path.join(os.getcwd(), "docker")
+    envs = []
+
+    if os.path.exists(docker_dir):
+        for file in os.listdir(docker_dir):
+            if file.startswith(".env.") and file.endswith(".envpatch"):
+                env_name = file[5:-9]  # 去掉 .env. 和 .envpatch
+                if env_name != "dev" and env_name != "example":
+                    full_path = os.path.join(docker_dir, file)
+                    envs.append((env_name, full_path))
+
+    return sorted(envs)
+
+
+
+def signal_handler(sig, frame):
+    """处理 Ctrl+C 信号"""
+    global USER_CANCELLED
+    if USER_CANCELLED:
+        # 防止重入，直接退出
+        os._exit(1)
+    USER_CANCELLED = True
+    try:
+        # 恢复终端设置
+        if sys.stdin.isatty():
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, termios.tcgetattr(sys.stdin.fileno()))
+    except:
+        pass
+    print(f"\n\n{Colors.YELLOW}⚠️  用户中断操作{Colors.RESET}")
+    print("\n清理中...")
+    sys.exit(0)
+
+
+# ========== 主函数 ==========
+
+def main(mode=None, env=None, yes=False, simple=False):
+    """主函数"""
+    global SKIP_CONFIRMATIONS, USER_CANCELLED, SIMPLE_MODE
+
+    # 设置信号处理
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # 设置跳过确认和简单模式
+    SKIP_CONFIRMATIONS = yes or SAFE_MODE
+    SIMPLE_MODE = simple
+
+    # 在 AlternateScreen 中运行整个程序（除非是简单模式）
+    if SIMPLE_MODE:
+        return _main_logic(mode, env)
+    else:
+        with AlternateScreen():
+            result = _main_logic(mode, env)
+        # AlternateScreen 退出后，显示简洁的最终结果
+        if result:
+            _display_final_result()
+        else:
+            # 任务失败时，显示失败信息
+            _display_failure_result()
+        return result
+
+
+def _aggregate_container_status(output: List[str]) -> List[str]:
+    """聚合容器状态显示"""
+    container_states = {}
+
+    # 解析所有容器状态变化
+    for line in output:
+        if "Container " in line and any(status in line for status in
+                                        ["Starting", "Started", "Stopping", "Stopped", "Removing", "Removed",
+                                         "Creating", "Created", "Waiting", "Healthy", "Unhealthy", "Error"]):
+
+            # 提取容器名和状态
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[0] == "Container":
+                container = parts[1]
+                status = parts[2]
+                container_states[container] = status
+
+    if not container_states:
+        return []
+
+    # 按状态分组
+    status_groups = {
+        "success": [],
+        "running": [],
+        "failed": [],
+        "other": []
+    }
+
+    for container, status in container_states.items():
+        # 简化容器名显示
+        simple_name = container.replace("mochat-dify-", "").replace("-1", "")
+
+        if status in ["Started", "Healthy", "Running"]:
+            status_groups["success"].append(f"{simple_name}")
+        elif status in ["Starting", "Waiting", "Creating"]:
+            status_groups["running"].append(f"{simple_name}")
+        elif status in ["Error", "Unhealthy", "Failed"]:
+            status_groups["failed"].append(f"{simple_name}")
+        else:
+            status_groups["other"].append(f"{simple_name}")
+
+    # 构建聚合状态输出
+    result = []
+    if status_groups["success"]:
+        result.append(f"✓ 成功启动: {', '.join(status_groups['success'])}")
+    if status_groups["running"]:
+        result.append(f"⏳ 启动中: {', '.join(status_groups['running'])}")
+    if status_groups["failed"]:
+        result.append(f"✗ 启动失败: {', '.join(status_groups['failed'])}")
+    if status_groups["other"]:
+        result.append(f"ℹ 其他状态: {', '.join(status_groups['other'])}")
+
+    return result
+
+
+def _display_failure_result():
+    """显示任务失败的结果"""
+    global LAST_EXECUTOR, CURRENT_MODE
+
+    # 使用统一的显示管理器
+    display_manager = DisplayManager()
+    display_manager.display_header("MOCHAT DIFY SETUP FAILED")
+
+    # 显示任务完成状态
+    if LAST_EXECUTOR and hasattr(LAST_EXECUTOR, 'completed_tasks'):
+        if LAST_EXECUTOR.completed_tasks:
+            # 准备任务列表包含耗时信息
+            tasks_with_elapsed = []
+            for idx, desc, success in LAST_EXECUTOR.completed_tasks:
+                # 获取任务耗时
+                elapsed_time = getattr(LAST_EXECUTOR, 'task_elapsed_times', {}).get(idx, 0)
+                tasks_with_elapsed.append((idx, desc, success, elapsed_time))
+
+            display_manager.display_task_list("任务执行状态", tasks_with_elapsed, show_elapsed=True)
+
+    # 显示失败信息
+    if LAST_EXECUTOR and hasattr(LAST_EXECUTOR, 'last_failure') and LAST_EXECUTOR.last_failure:
+        desc, output = LAST_EXECUTOR.last_failure
+        print(f"\n{Colors.RED}✗ 任务失败: {desc}{Colors.RESET}")
+
+        # 如果是 Docker Compose 相关的错误，显示聚合的容器状态
+        if "docker" in desc.lower() and "compose" in desc.lower():
+            aggregated_status = _aggregate_container_status(output)
+            if aggregated_status:
+                display_manager.display_task_details("容器状态", aggregated_status)
+            else:
+                # 如果聚合失败，显示原始错误
+                display_manager.display_logs("错误信息", output, max_lines=10)
+        else:
+            # 非 Docker Compose 错误，显示原始输出
+            display_manager.display_logs("错误信息", output, max_lines=15)
+
+        # 提供解决建议
+        suggestions = []
+        if "docker" in desc.lower():
+            suggestions.extend([
+                "确保 Docker 已启动",
+                "运行: docker version",
+                "检查 Docker 日志: docker compose logs api"
+            ])
+        elif "依赖" in desc:
+            suggestions.extend([
+                "检查网络连接",
+                "清理缓存后重试"
+            ])
+
+        if suggestions:
+            display_manager.display_task_details("💡 可能的解决方案", suggestions)
+        elif "unhealthy" in str(output):
+            unhealthy_suggestions = [
+                "检查容器健康状态: docker ps",
+                "查看容器日志: docker compose logs api",
+                "确保端口没有被占用",
+                "尝试重新构建镜像: ./build-image api"
+            ]
+            display_manager.display_task_details("💡 可能的解决方案", unhealthy_suggestions)
+
+    # 显示页脚
+    display_manager.display_footer()
+
+
+def _display_final_result():
+    """显示最终的简洁结果"""
+    global LAST_EXECUTOR, CURRENT_MODE
+
+    # 清屏后显示最终结果，避免重复
+    print("\033[2J\033[H", end='')
+
+    width = 80
+    title = "MOCHAT DIFY SETUP COMPLETED"
+    padding = (width - len(title)) // 2
+    print(f"{' ' * padding}{Colors.CYAN}{title}{Colors.RESET}")
+    print(f"{Colors.DIM}{'=' * width}{Colors.RESET}")
+
+    # 如果有执行器实例，显示任务完成状态和详情
+    if LAST_EXECUTOR and hasattr(LAST_EXECUTOR, 'completed_tasks'):
+        # 显示所有任务的最终状态
+        if LAST_EXECUTOR.completed_tasks:
+            print(f"\n{Colors.CYAN}▶ 任务完成状态{Colors.RESET}")
+            total_tasks = len(LAST_EXECUTOR.completed_tasks)
+            for idx, desc, success in LAST_EXECUTOR.completed_tasks:
+                symbol = TaskSymbols.SUCCESS if success else TaskSymbols.FAILED
+                # 获取任务耗时
+                elapsed_time = getattr(LAST_EXECUTOR, 'task_elapsed_times', {}).get(idx, 0)
+                elapsed_str = f" (耗时: {elapsed_time}s)" if elapsed_time > 0 else ""
+                print(f"  {symbol} [{idx}/{total_tasks}] {desc}{elapsed_str}")
+
+        # 显示所有任务的详情（过滤空行）
+        if LAST_EXECUTOR.all_task_details:
+            print(f"\n{Colors.CYAN}▶ 任务详情{Colors.RESET}")
+            for task_desc, details in LAST_EXECUTOR.all_task_details:
+                # 过滤空行和空字符串
+                filtered_details = [d for d in details if d and d.strip()]
+                if filtered_details:
+                    print(f"\n  {Colors.DIM}• {task_desc}:{Colors.RESET}")
+                    for detail in filtered_details:
+                        # 特殊样式：警告信息
+                        if "⚠" in detail or "warning" in detail.lower():
+                            print(f"    {Colors.YELLOW}⚠{Colors.RESET} {detail.replace('⚠', '').strip()}")
+                        # 特殊样式：镜像信息
+                        elif "registry" in detail:
+                            print(f"    {Colors.GREEN}✓{Colors.RESET} {detail}")
+                        # 普通成功信息
+                        elif detail.startswith("✓"):
+                            print(f"    {detail}")
+                        # 其他信息
+                        else:
+                            print(f"    {Colors.DIM}{detail}{Colors.RESET}")
+
+    # 显示 Docker 环境信息（如果是 Docker 模式）
+    if CURRENT_MODE in ["2", "3"]:
+        print(f"\n{Colors.CYAN}▶ Docker 环境{Colors.RESET}")
+        # 获取 Docker 版本
+        try:
+            result = subprocess.run("docker version --format '{{.Server.Version}}'",
+                                    shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                docker_version = result.stdout.strip()
+                print(f"  • Docker 版本: {docker_version}")
+        except:
+            pass
+
+        # 获取构建的镜像信息
+        try:
+            result = subprocess.run("docker images | grep 'mochat-dify' | grep -v 'milvus'",
+                                    shell=True, capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                print(f"  • 构建的镜像:")
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        print(f"    - {parts[0]}:{parts[1]}")
+        except:
+            pass
+
+    # 显示成功消息和"接下来你可以："引导语
+    if CURRENT_MODE == "1":
+        print(f"\n✓ 本地开发环境已准备就绪")
+        print(f"\n数据库服务已启动，依赖已安装，现在可以手动启动应用：")
+
+        print(f"\n{Colors.CYAN}▶ 启动 API 后端：{Colors.RESET}")
+        print(f"  cd backend")
+        print(f"  uv run uvicorn main:app --reload")
+
+        print(f"\n{Colors.CYAN}▶ 启动 Web 前端（新终端）：{Colors.RESET}")
+        print(f"  cd web")
+        print(f"  pnpm dev")
+
+        print(f"\n{Colors.CYAN}▶ 访问地址：{Colors.RESET}")
+        print(f"  • Web 界面: http://localhost:3000")
+        print(f"  • API 接口: http://localhost:8000/api/v1")
+        print(f"  • 管理接口: http://localhost:8000/api/admin")
+        print(f"  • API 文档: http://localhost:8000/docs")
+    elif CURRENT_MODE == "2":
+        print(f"\n🐳 Docker 容器服务已启动（镜像已自动构建）")
+        print(f"\n{Colors.CYAN}▶ 接下来你可以：{Colors.RESET}")
+        print(f"  1. 查看日志: cd docker && docker compose logs -f")
+        print(f"  2. 访问 http://localhost:3000 开始使用")
+        print(f"  3. 修改代码后重新构建: ./build-image api 或 ./build-image web")
+    else:  # 模式3 - 生产部署
+        print(f"\n🚀 生产环境已成功部署")
+        print(f"\n{Colors.CYAN}▶ 接下来你可以：{Colors.RESET}")
+        print(f"  1. 部署到服务器: docker compose -f docker-compose.prod.yml up -d")
+        print(f"  2. 配置反向代理和域名")
+        print(f"  3. 设置 SSL 证书")
+
+    # 模式2和3显示额外的访问地址和管理命令
+    if CURRENT_MODE in ["2", "3"]:
+        # TODO: 获取实际的端口配置
+        print(f"\n{Colors.CYAN}▶ 访问地址{Colors.RESET}")
+        print(f"  • Web 前端: http://localhost:3000")
+        print(f"  • API 后端: http://localhost:8000")
+        print(f"  • API 文档: http://localhost:8000/docs")
+        print(f"\n{Colors.CYAN}▶ 管理命令{Colors.RESET}")
+        print(f"  • 查看日志: cd docker && docker compose logs -f [service]")
+        print(f"  • 停止服务: cd docker && docker compose down")
+        print(f"  • 重启服务: cd docker && docker compose restart")
+        print(f"  • 重新部署: ./dev-setup -m {CURRENT_MODE} -y")
+
+    print(f"\n{Colors.GREEN}✓ 所有操作已完成！{Colors.RESET}")
+    print(f"{Colors.DIM}{'─' * width}{Colors.RESET}")
+    print()  # 添加一个空行，让输出更整洁
+
+
+def _main_logic(mode, env):
+    """主逻辑"""
+    global CURRENT_MODE
+
+    # 获取模式配置
+    modes_config = get_modes_config()
+
+    # 选择模式
+    if mode is None:
+        if NO_MENU:
+            mode = "2"  # 默认 Docker 模式
+            print("🚀 MoChat 开发环境设置")
+            print("使用默认模式: Docker 开发模式")
+        else:
+            options = [
+                modes_config["1"]["desc"],
+                modes_config["2"]["desc"],
+                modes_config["3"]["desc"],
+                "退出"
+            ]
+
+            choice = UI.menu("请选择部署模式:", options)
+            if choice is None or choice == 3:
+                print("\n已取消")
+                return
+
+            mode = str(choice + 1)
+
+    # 获取模式配置
+    mode_config = modes_config.get(mode)
+    if not mode_config:
+        print(f"{Colors.RED}无效的模式: {mode}{Colors.RESET}")
+        return
+
+    CURRENT_MODE = mode
+    print(f"\n已选择: {Colors.GREEN}{mode_config['name']}{Colors.RESET}")
+
+    # 生产模式选择环境
+    envpatch_file = None
+    if mode == "3":
+        envs = get_available_environments()
+        if not envs:
+            print(f"{Colors.RED}未找到任何环境配置文件{Colors.RESET}")
+            return
+
+        if env:
+            # 命令行指定了环境
+            for env_name, env_path in envs:
+                if env_name == env:
+                    envpatch_file = env_path
+                    break
+            if not envpatch_file:
+                print(f"{Colors.RED}未找到环境: {env}{Colors.RESET}")
+                return
+        else:
+            # 交互式选择
+            env_options = [f"{name} ({os.path.basename(path)})" for name, path in envs]
+            env_choice = UI.menu("请选择部署环境:", env_options)
+            if env_choice is None:
+                print("\n已取消")
+                return
+            envpatch_file = envs[env_choice][1]
+
+    # 准备任务列表
+    tasks = []
+    for task_def in mode_config.get("tasks", []):
+        if len(task_def) == 2:
+            cmd_id, desc = task_def
+            params = {}
+        else:
+            cmd_id, desc, params = task_def
+
+        # 处理特殊参数
+        if mode == "3" and cmd_id.startswith("config:") and envpatch_file:
+            params["envpatch"] = envpatch_file
+
+        tasks.append((cmd_id, desc, params))
+
+    # 准备并行任务
+    parallel_tasks = []
+    for task_def in mode_config.get("parallel", []):
+        if len(task_def) == 2:
+            cmd_id, desc = task_def
+            params = {}
+        else:
+            cmd_id, desc, params = task_def
+
+        parallel_tasks.append((cmd_id, desc, params))
+
+    # 执行任务
+    print(f"\n{Colors.CYAN}开始执行...{Colors.RESET}")
+    executor = TaskExecutor()
+    success = executor.execute_tasks(tasks, parallel_tasks, mode_config["name"])
+
+    # 保存执行器实例供后续使用
+    global LAST_EXECUTOR
+    LAST_EXECUTOR = executor
+
+    # 显示结果（简单模式下才显示，手动模式已经在 _display_final_summary 中显示）
+    if success and SIMPLE_MODE:
+        if mode in ["2", "3"]:
+            print("\n📍 访问地址:")
+            print("  • Web 前端: http://localhost:18080/dify")
+            print("  • API 文档: http://localhost:15001/v1/uai/docs/")
+            print("\n🔧 管理命令:")
+            print("  • 查看日志: cd docker && docker compose logs -f")
+            print("  • 停止服务: cd docker && docker compose down")
+            print("  • 重启服务: ./dev-setup -m 2 -y")
+        else:
+            print("\n📝 启动命令:")
+            print("  • API 后端: cd backend && uv run uvicorn main:app --reload")
+            print("  • Web 前端: cd web && pnpm dev")
+    elif not success:
+        print(f"\n{Colors.RED}❌ 设置失败{Colors.RESET}")
+        print("\n请检查错误信息并重试")
+
+    return success
+
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description="MoChat 开发环境设置工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  ./dev-setup                     # 交互式模式
+  ./dev-setup -m 1               # 本地开发模式
+  ./dev-setup -m 2 -y            # Docker模式（跳过确认）
+  ./dev-setup -m 3 -e prod       # 部署到生产环境
+  ./dev-setup -m 2 -y --simple    # 简单输出模式（适合 Claude Code）
+        """
+    )
+
+    parser.add_argument('-m', '--mode', type=str, choices=['1', '2', '3'],
+                        help='部署模式: 1=本地开发, 2=Docker开发, 3=生产部署')
+    parser.add_argument('-e', '--env', type=str,
+                        help='环境名称（仅生产模式需要）')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='跳过所有确认提示')
+    parser.add_argument('--simple', action='store_true',
+                        help='简单输出模式，不使用实时日志（适合自动化工具）')
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+
+    # 正常模式
+    main(mode=args.mode, env=args.env, yes=args.yes, simple=args.simple)

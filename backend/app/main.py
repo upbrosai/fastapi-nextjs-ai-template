@@ -10,6 +10,22 @@ from app.core.config import settings
 def custom_generate_unique_id(route: APIRoute) -> str:
     return f"{route.tags[0]}-{route.name}"
 
+# Setup Remote Debugging with PyCharm, when in development environment, especially for Docker.
+# PyCharm Python Debugger Server: https://www.jetbrains.com/help/pycharm/remote-debugging-with-product.html
+if settings.ENVIRONMENT == "local" and settings.PYCHARM_DEBUG_ENABLED:
+    try:
+        import pydevd_pycharm
+        print(f"PyCharm debug server: {settings.PYCHARM_DEBUG_HOST}:{settings.PYCHARM_DEBUG_PORT}")
+        pydevd_pycharm.settrace(
+            settings.PYCHARM_DEBUG_HOST,
+            port=settings.PYCHARM_DEBUG_PORT,
+            stdout_to_server=True,
+            stderr_to_server=True,
+        )
+    except ImportError:
+        print("pydevd-pycharm not available, add the package by 'uv sync --dev'")
+    except Exception as e:
+        print(f"pydevd-pycharm setup failed: {e}")
 
 if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     sentry_sdk.init(dsn=str(settings.SENTRY_DSN), enable_tracing=True)

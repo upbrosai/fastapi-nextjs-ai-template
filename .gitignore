@@ -1,6 +1,10 @@
 .vscode
+.idea/
 node_modules/
 /test-results/
 /playwright-report/
 /blob-report/
 /playwright/.cache/
+# Environment variables - ignore all .env files
+.env
+/frontend.bak/

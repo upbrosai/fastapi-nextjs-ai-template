@@ -128,7 +128,13 @@ git merge --continue
 
 ### Configure
 
-You can then update configs in the `.env` files to customize your configurations.
+You can then update configs in the module-specific `.env` files to customize your configurations. Copy the .env.example templates to get started:
+
+```bash
+cp docker/.env.example docker/.env
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env
+```
 
 Before deploying it, make sure you change at least the values for:
 
@@ -142,7 +148,7 @@ Read the [deployment.md](./deployment.md) docs for more details.
 
 ### Generate Secret Keys
 
-Some environment variables in the `.env` file have a default value of `changethis`.
+Some environment variables in the `.env` files have a default value of `changethis`.
 
 You have to change them with a secret key, to generate secret keys you can run the following command:
 

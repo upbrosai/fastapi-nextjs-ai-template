@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+
+"""
+env-patch - Simple patch utility for .env files
+
+Features:
+- Applies .envpatch files to .env.example
+- Compares before writing to avoid unnecessary updates
+- Shows diff when changes are made
+- Supports strict mode for key validation
+
+Python 3.6+ required.
+"""
+
+__version__ = "1.0.0"
+__author__ = "🦄 MoChat Team"
+__credits__ = "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+
+import argparse
+import difflib
+import os
+import re
+import sys
+from typing import Dict, List, Tuple
+
+
+# Terminal colors
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    CYAN = "\033[36m"
+
+
+# Status symbols
+class Emoji:
+    SUCCESS = "✓"
+    ERROR = "✗"
+    WARNING = "⚠"
+    INFO = "→"
+    CHANGE = "≠"
+
+
+def color_text(text: str, color: str) -> str:
+    """Add color to text."""
+    return f"{color}{text}{Colors.RESET}"
+
+
+def find_envpatch_files() -> List[str]:
+    """Find all .envpatch files in the current directory."""
+    patch_files = []
+    for filename in os.listdir('.'):
+        if os.path.isfile(filename) and filename.endswith('.envpatch'):
+            patch_files.append(filename)
+    patch_files.sort()
+    return patch_files
+
+
+def show_version():
+    """Show version information."""
+    print(f"env-patch {__version__}")
+    print(f"{__author__}")
+    print(f"{__credits__}")
+
+
+def show_help():
+    """Show help message."""
+    help_text = f"""
+{color_text('env-patch - Simple patch utility for .env files', Colors.BOLD)}
+
+{color_text('Usage:', Colors.BOLD)}
+  ./env-patch [options]
+
+{color_text('Options:', Colors.BOLD)}
+  -e, --example FILE    Input example file (default: .env.example)
+  -o, --output FILE     Output file (default: .env)
+  -p, --patch FILE      Specific patch file to apply
+  -s, --strict          Strict mode: error if patch contains unknown keys
+  -h, --help            Show this help message
+  -v, --version         Show version information
+
+{color_text('Examples:', Colors.BOLD)}
+  ./env-patch                                 # Auto-detect .envpatch file
+  ./env-patch -p docker/.dev.envpatch        # Apply specific patch
+  ./env-patch -e .env.template -o .env       # Custom input/output
+  ./env-patch --strict                        # Strict mode
+
+{color_text('Notes:', Colors.BOLD)}
+  - Patch files must end with '.envpatch'
+  - If multiple .envpatch files exist, use -p to specify one
+  - Always regenerates output from example + patch
+"""
+    print(help_text)
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-e", "--example", default=".env.example")
+    parser.add_argument("-o", "--output", default=".env")
+    parser.add_argument("-p", "--patch")
+    parser.add_argument("-s", "--strict", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-v", "--version", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.help:
+        show_help()
+        sys.exit(0)
+
+    if args.version:
+        show_version()
+        sys.exit(0)
+
+    return args
+
+
+def load_file(filename: str) -> List[str]:
+    """Load a file and return its lines."""
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return f.readlines()
+    except FileNotFoundError:
+        return []
+
+
+def parse_env_dict(lines: List[str]) -> Dict[str, str]:
+    """Parse env file lines into a dictionary."""
+    env_dict = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        match = re.match(r"^([^=]+)=(.*)$", line)
+        if match:
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+            env_dict[key] = value
+
+    return env_dict
+
+
+def apply_patch(example_lines: List[str], patch_dict: Dict[str, str],
+                strict: bool = False) -> Tuple[List[str], Dict[str, int], List[str]]:
+    """Apply patch to example lines and return result with stats and warnings."""
+    result_lines = []
+    example_dict = parse_env_dict(example_lines)
+    applied_keys = set()
+    warnings = []
+
+    stats = {
+        "total": len(example_dict),
+        "patched": 0,
+        "added": 0,
+        "unknown": 0
+    }
+
+    # Process each line from example
+    for line in example_lines:
+        stripped = line.strip()
+
+        if not stripped or stripped.startswith("#"):
+            result_lines.append(line)
+            continue
+
+        match = re.match(r"^([^=]+)=(.*)$", stripped)
+        if match:
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+
+            if key in patch_dict:
+                value = patch_dict[key]
+                applied_keys.add(key)
+                stats["patched"] += 1
+
+            result_lines.append(f"{key}={value}\n")
+
+    # Add unknown keys from patch (unless in strict mode)
+    additional_keys = []
+    for key, value in patch_dict.items():
+        if key not in applied_keys:
+            stats["unknown"] += 1
+            if strict:
+                raise ValueError(f"Key '{key}' not found in example file")
+            else:
+                # Add the key to the output
+                additional_keys.append((key, value))
+                warnings.append(f"Key '{key}' not found in example file, adding anyway")
+                stats["added"] += 1
+
+    # Append additional keys at the end
+    if additional_keys:
+        result_lines.append("\n# Additional keys from patch file\n")
+        for key, value in additional_keys:
+            result_lines.append(f"{key}={value}\n")
+
+    return result_lines, stats, warnings
+
+
+def show_diff(old_content: str, new_content: str, filename: str):
+    """Display differences between old and new content."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"{filename} (before)",
+        tofile=f"{filename} (after)",
+        n=3
+    ))
+
+    if diff:
+        print(f"\n{Emoji.CHANGE} Changes to {filename}:")
+        for line in diff:
+            line = line.rstrip()
+            if line.startswith('+') and not line.startswith('+++'):
+                print(color_text(line, Colors.GREEN))
+            elif line.startswith('-') and not line.startswith('---'):
+                print(color_text(line, Colors.RED))
+            elif line.startswith('@'):
+                print(color_text(line, Colors.CYAN))
+            else:
+                print(line)
+
+
+def main():
+    """Main function."""
+    args = parse_args()
+
+    # Check if example file exists
+    if not os.path.isfile(args.example):
+        print(color_text(f"{Emoji.ERROR} Example file not found: {args.example}", Colors.RED))
+        print(f"\nRun './env-patch -h' for help")
+        sys.exit(1)
+
+    # Find or validate patch files
+    patch_files = []
+    if args.patch:
+        if not args.patch.endswith('.envpatch'):
+            print(color_text(f"{Emoji.ERROR} Patch file must end with '.envpatch': {args.patch}", Colors.RED))
+            print(f"\nRun './env-patch -h' for help")
+            sys.exit(1)
+        if not os.path.isfile(args.patch):
+            print(color_text(f"{Emoji.ERROR} Patch file not found: {args.patch}", Colors.RED))
+            print(f"\nRun './env-patch -h' for help")
+            sys.exit(1)
+        patch_files = [args.patch]
+    else:
+        # Auto-detect patch files
+        found_patches = find_envpatch_files()
+
+        if len(found_patches) > 1:
+            print(color_text(f"{Emoji.ERROR} Multiple .envpatch files found", Colors.RED))
+            print(f"\nRun './env-patch -h' for help")
+            print(f"\n{color_text('Example:', Colors.BOLD)} ./env-patch -p {found_patches[0]}")
+            sys.exit(1)
+
+        patch_files = found_patches
+
+    # Load example file
+    example_lines = load_file(args.example)
+
+    # If no patch files, just copy example
+    if not patch_files:
+        print(f"{Emoji.INFO} No .envpatch files found, copying {args.example} to {args.output}")
+
+        current_content = ''.join(load_file(args.output))
+        new_content = ''.join(example_lines)
+
+        if current_content == new_content:
+            print(f"{Emoji.SUCCESS} {args.output} is already up to date")
+            return
+
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.writelines(example_lines)
+
+        print(f"{Emoji.SUCCESS} Created {args.output}")
+        return
+
+    # Load and apply patch
+    print(f"{Emoji.INFO} Applying patch: {patch_files[0]}")
+    patch_lines = load_file(patch_files[0])
+    patch_dict = parse_env_dict(patch_lines)
+
+    # Apply patch
+    try:
+        result_lines, stats, warnings = apply_patch(example_lines, patch_dict, args.strict)
+    except ValueError as e:
+        print(color_text(f"{Emoji.ERROR} {e}", Colors.RED))
+        sys.exit(1)
+
+    # Show warnings
+    for warning in warnings:
+        print(color_text(f"{Emoji.WARNING} {warning}", Colors.YELLOW))
+
+    # Compare with existing file
+    new_content = ''.join(result_lines)
+    old_content = ''.join(load_file(args.output))
+
+    if old_content == new_content:
+        print(f"\n{Emoji.SUCCESS} {args.output} is already up to date")
+        print(f"Total keys: {stats['total']}, Patched: {stats['patched']}")
+        return
+
+    # Write new content
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    # Show diff if content changed
+    if old_content:
+        show_diff(old_content, new_content, args.output)
+
+    # Print summary
+    print(f"\n{color_text('SUMMARY', Colors.BOLD)}")
+    print(f"Total keys: {color_text(str(stats['total']), Colors.GREEN)}")
+    print(f"Patched keys: {color_text(str(stats['patched']), Colors.GREEN)}")
+
+    if stats['added'] > 0:
+        print(f"Added keys: {color_text(str(stats['added']), Colors.YELLOW)}")
+
+    print(f"\n{Emoji.SUCCESS} {color_text('Patch completed successfully', Colors.GREEN)}")
+
+
+if __name__ == "__main__":
+    main()
