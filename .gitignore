@@ -7,4 +7,3 @@ node_modules/
 /playwright/.cache/
 # Environment variables - ignore all .env files
 .env
-/frontend.bak/
