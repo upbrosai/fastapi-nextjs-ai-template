@@ -9,7 +9,7 @@ Features:
 - Shows diff when changes are made
 - Supports strict mode for key validation
 
-Python 3.6+ required.
+Python 3.10+ required.
 """
 
 __version__ = "1.0.0"
