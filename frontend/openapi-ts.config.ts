@@ -5,6 +5,6 @@ export default {
         // 基础插件配置
         "@hey-api/typescript",
         "@hey-api/sdk",
+        "@hey-api/client-axios",
     ],
-    client: "@hey-api/client-axios",
 }
