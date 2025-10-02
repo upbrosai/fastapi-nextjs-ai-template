@@ -8,3 +8,8 @@ node_modules/
 # Environment variables - ignore all .env files
 .env
 /frontend.bak/
+
+# Docker volumes data
+# 忽略docker/volumes下的所有内容，但保留.gitkeep文件以维持目录结构
+docker/volumes/*
+!docker/volumes/.gitkeep

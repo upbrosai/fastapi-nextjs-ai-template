@@ -5,7 +5,8 @@
 * Start the local stack with Docker Compose:
 
 ```bash
-docker compose -f docker/docker-compose.yml watch
+cd docker
+docker compose -f docker-compose.yml watch
 ```
 
 * Now you can open your browser and interact with these URLs:
@@ -18,20 +19,20 @@ Automatic interactive documentation with Swagger UI (from the OpenAPI backend): 
 
 Adminer, database web administration: http://localhost:8080
 
-Traefik UI, to see how the routes are being handled by the proxy: http://localhost:8090
-
 **Note**: The first time you start your stack, it might take a minute for it to be ready. While the backend waits for the database to be ready and configures everything. You can check the logs to monitor it.
 
 To check the logs, run (in another terminal):
 
 ```bash
-docker compose -f docker/docker-compose.yml logs
+cd docker
+docker compose -f docker-compose.yml logs
 ```
 
 To check the logs of a specific service, add the name of the service, e.g.:
 
 ```bash
-docker compose -f docker/docker-compose.yml logs backend
+cd docker
+docker compose -f docker-compose.yml logs backend
 ```
 
 ## Local Development
@@ -45,14 +46,15 @@ This way, you could turn off a Docker Compose service and start its local develo
 For example, you can stop that `frontend` service in the Docker Compose, in another terminal, run:
 
 ```bash
-docker compose -f docker/docker-compose.yml stop frontend
+cd docker
+docker compose -f docker-compose.yml stop frontend
 ```
 
 And then start the local frontend development server:
 
 ```bash
 cd frontend
-npm run dev
+pnpm run dev
 ```
 
 Or you could stop the `backend` Docker Compose service:
@@ -68,39 +70,9 @@ cd backend
 fastapi dev app/main.py
 ```
 
-## Docker Compose in `localhost.upbrosai.com`
-
-When you start the Docker Compose stack, it uses `localhost` by default, with different ports for each service (backend, frontend, adminer, etc).
-
-When you deploy it to production (or staging), it will deploy each service in a different subdomain, like `api.example.com` for the backend and `dashboard.example.com` for the frontend.
-
-In the guide about [deployment](deployment.md) you can read about Traefik, the configured proxy. That's the component in charge of transmitting traffic to each service based on the subdomain.
-
-If you want to test that it's all working locally, you can edit the `docker/.env` file, and change:
-
-```dotenv
-DOMAIN=localhost.upbrosai.com
-```
-
-That will be used by the Docker Compose files to configure the base domain for the services.
-
-Traefik will use this to transmit traffic at `api.localhost.upbrosai.com` to the backend, and traffic at `dashboard.localhost.upbrosai.com` to the frontend.
-
-The domain `localhost.upbrosai.com` is a special domain that is configured (with all its subdomains) to point to `127.0.0.1`. This way you can use that for your local development.
-
-After you update it, run again:
-
-```bash
-docker compose -f docker/docker-compose.yml watch
-```
-
-When deploying, for example in production, the main Traefik is configured outside of the Docker Compose files. For local development, there's an included Traefik in `docker-compose.override.yml`, just to let you test that the domains work as expected, for example with `api.localhost.upbrosai.com` and `dashboard.localhost.upbrosai.com`.
-
 ## Docker Compose files and env vars
 
 There is a main `docker/docker-compose.yml` file with all the configurations that apply to the whole stack, it is used automatically by `docker compose`.
-
-And there's also a `docker/docker-compose.override.yml` with overrides for development, for example to mount the source code as a volume. It is used automatically by `docker compose` to apply overrides on top of `docker-compose.yml`.
 
 These Docker Compose files use the `docker/.env` file containing configurations to be injected as environment variables in the containers.
 
@@ -109,7 +81,8 @@ They also use some additional configurations taken from environment variables se
 After changing variables, make sure you restart the stack:
 
 ```bash
-docker compose -f docker/docker-compose.yml watch
+cd docker
+docker compose -f docker-compose.yml watch
 ```
 
 ## Environment Variables
@@ -187,26 +160,4 @@ Automatic Interactive Docs (Swagger UI): http://localhost:8000/docs
 
 Automatic Alternative Docs (ReDoc): http://localhost:8000/redoc
 
-Adminer: http://localhost:8080
-
-Traefik UI: http://localhost:8090
-
 MailCatcher: http://localhost:1080
-
-### Development URLs with `localhost.upbrosai.com` Configured
-
-Development URLs, for local development.
-
-Frontend: http://dashboard.localhost.upbrosai.com
-
-Backend: http://api.localhost.upbrosai.com
-
-Automatic Interactive Docs (Swagger UI): http://api.localhost.upbrosai.com/docs
-
-Automatic Alternative Docs (ReDoc): http://api.localhost.upbrosai.com/redoc
-
-Adminer: http://localhost.upbrosai.com:8080
-
-Traefik UI: http://localhost.upbrosai.com:8090
-
-MailCatcher: http://localhost.upbrosai.com:1080
